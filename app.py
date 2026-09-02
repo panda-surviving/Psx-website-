@@ -4564,6 +4564,13 @@ FOREX_TECH_SYMBOLS = [
 ]
 
 CRYPTO_TECH_SYMBOLS = [
+    # Confirmed against Yahoo Finance's live intraday feed: these return
+    # real 30m/60m OHLC bars. An earlier, larger list (45 coins) included
+    # many legitimate tickers (ATOM, ETC, XLM, MKR, AAVE, ALGO, etc.) that
+    # Yahoo's free intraday endpoint simply never returns bars for at any
+    # granularity — that's a real limitation of the free data source, not
+    # a symbol/code bug, and including them just produced a wall of
+    # "Could not analyze: no data returned" noise on every scan.
     {"yf": "BTC-USD", "display": "Bitcoin (BTC)"},
     {"yf": "ETH-USD", "display": "Ethereum (ETH)"},
     {"yf": "USDT-USD", "display": "Tether (USDT)"},
@@ -4582,33 +4589,6 @@ CRYPTO_TECH_SYMBOLS = [
     {"yf": "BCH-USD", "display": "Bitcoin Cash (BCH)"},
     {"yf": "NEAR-USD", "display": "NEAR Protocol (NEAR)"},
     {"yf": "LTC-USD", "display": "Litecoin (LTC)"},
-    {"yf": "ICP-USD", "display": "Internet Computer (ICP)"},
-    {"yf": "LEO-USD", "display": "UNUS SED LEO (LEO)"},
-    {"yf": "DAI-USD", "display": "Dai (DAI)"},
-    {"yf": "ATOM-USD", "display": "Cosmos (ATOM)"},
-    {"yf": "ETC-USD", "display": "Ethereum Classic (ETC)"},
-    {"yf": "XLM-USD", "display": "Stellar (XLM)"},
-    {"yf": "OKB-USD", "display": "OKB"},
-    {"yf": "XMR-USD", "display": "Monero (XMR)"},
-    {"yf": "FIL-USD", "display": "Filecoin (FIL)"},
-    {"yf": "HBAR-USD", "display": "Hedera (HBAR)"},
-    {"yf": "VET-USD", "display": "VeChain (VET)"},
-    {"yf": "MKR-USD", "display": "Maker (MKR)"},
-    {"yf": "OP-USD", "display": "Optimism (OP)"},
-    {"yf": "AAVE-USD", "display": "Aave (AAVE)"},
-    {"yf": "ALGO-USD", "display": "Algorand (ALGO)"},
-    {"yf": "QNT-USD", "display": "Quant (QNT)"},
-    {"yf": "SAND-USD", "display": "The Sandbox (SAND)"},
-    {"yf": "EOS-USD", "display": "EOS"},
-    {"yf": "XTZ-USD", "display": "Tezos (XTZ)"},
-    {"yf": "THETA-USD", "display": "Theta Network (THETA)"},
-    {"yf": "MANA-USD", "display": "Decentraland (MANA)"},
-    {"yf": "CRO-USD", "display": "Cronos (CRO)"},
-    {"yf": "ZEC-USD", "display": "Zcash (ZEC)"},
-    {"yf": "DASH-USD", "display": "Dash (DASH)"},
-    {"yf": "CHZ-USD", "display": "Chiliz (CHZ)"},
-    {"yf": "CRV-USD", "display": "Curve DAO (CRV)"},
-    {"yf": "COMP-USD", "display": "Compound (COMP)"},
 ]
 
 INTRADAY_DIVERGENCE_LOOKBACK = 60
@@ -4668,8 +4648,20 @@ def analyze_intraday_symbol(df):
     if df is None or len(df) < INTRADAY_STRUCTURE_LOOKBACK:
         return {"error": f"Not enough bars ({0 if df is None else len(df)}) for analysis."}
 
+    # A duplicated "close" label (seen from some yfinance responses, e.g.
+    # multi-index columns that didn't fully flatten) makes df["close"] a
+    # DataFrame instead of a Series, which crashes the assignment below
+    # with "Cannot set a DataFrame with multiple columns to the single
+    # column rsi". Collapse any duplicate column labels to their first
+    # occurrence before computing anything.
+    if df.columns.duplicated().any():
+        df = df.loc[:, ~df.columns.duplicated()]
+
     df = df.sort_values("date").reset_index(drop=True)
-    df["rsi"] = core.compute_rsi(df["close"], core.RSI_PERIOD)
+    close = df["close"]
+    if isinstance(close, pd.DataFrame):
+        close = close.iloc[:, 0]
+    df["rsi"] = core.compute_rsi(close, core.RSI_PERIOD)
 
     bullish = core.check_bullish_divergence(df, INTRADAY_DIVERGENCE_LOOKBACK, INTRADAY_SWING_ORDER)
     bearish = core.check_bearish_divergence(df, INTRADAY_DIVERGENCE_LOOKBACK, INTRADAY_SWING_ORDER)
@@ -5863,16 +5855,23 @@ CHART_TIMEFRAME_CONFIG = {
     # history is not supplied by the upstream provider.
     "1H": {"mode": "intraday", "interval": "60m", "period": "60d", "resample": None},
     "5H": {"mode": "intraday", "interval": "60m", "period": "60d", "resample": "5h"},
-    # The label is the candle size, not the visible-window size.
-    "1D": {"mode": "daily", "years": 12, "resample": None},
-    "5D": {"mode": "daily", "years": 12, "resample": "5D"},
-    "1M": {"mode": "daily", "years": 15, "resample": "ME"},
-    "3M": {"mode": "daily", "years": 20, "resample": "QE"},
-    "6M": {"mode": "daily", "years": 20, "resample": "6ME"},
-    "1Y": {"mode": "daily", "years": 25, "resample": "YE"},
-    "3Y": {"mode": "daily", "years": 30, "resample": "3YE"},
-    "5Y": {"mode": "daily", "years": 35, "resample": "5YE"},
-    "ALL": {"mode": "daily", "years": None, "resample": None},
+    # "years" bounds the VISIBLE WINDOW, not just the candle size. An
+    # earlier version showed up to 12+ years of daily candles for "1D" —
+    # thousands of bars compressed into one chart, which rendered as a
+    # dense, broken-looking hash pattern rather than a readable recent
+    # chart. Each button below now shows a window sized so the candle
+    # count stays readable (roughly 40-250 bars), the same way "1D"/"1M"/
+    # "1Y" behave in every normal stock-charting tool: the label is how
+    # far back you're looking, and the candle size is chosen for that.
+    "1D": {"mode": "daily", "years": 30 / 365.25, "resample": None},
+    "5D": {"mode": "daily", "years": 90 / 365.25, "resample": None},
+    "1M": {"mode": "daily", "years": 180 / 365.25, "resample": None},
+    "3M": {"mode": "daily", "years": 1, "resample": None},
+    "6M": {"mode": "daily", "years": 2, "resample": "3D"},
+    "1Y": {"mode": "daily", "years": 5, "resample": "W"},
+    "3Y": {"mode": "daily", "years": 10, "resample": "ME"},
+    "5Y": {"mode": "daily", "years": 20, "resample": "ME"},
+    "ALL": {"mode": "daily", "years": None, "resample": "ME"},
 }
 CHART_MIN_CANDLES = 5
 
@@ -6203,6 +6202,20 @@ def portfolio_import_csv():
     return jsonify({"ok": True, "added": added, "updated": updated, "skipped": skipped})
 
 
+# Run unconditionally at import time, not just under `if __name__ ==
+# "__main__"`. Render (and any real deployment) runs `gunicorn app:app`,
+# which imports this module without ever executing that block — so
+# init_db() never created the SQLite tables, and start_bulk_refresh_thread()
+# never started the periodic background warm-up, in production. Every
+# screener_runs/holdings/watchlist/etc. query was silently failing against
+# a table that didn't exist (each caller wraps its DB calls in a bare
+# try/except and no-ops on failure), which is why nothing ever persisted
+# and the screener always paid the full cold-start cost. gunicorn's
+# `--workers 1` config means this module is imported exactly once, so this
+# still runs exactly once in production, same as it did in dev mode before.
+init_db()
+start_bulk_refresh_thread()
+
 if __name__ == "__main__":
     # use_reloader=False: on Windows, Flask's auto-reloader spawns a
     # second watcher process and re-runs this whole file. Combined with
@@ -6214,6 +6227,4 @@ if __name__ == "__main__":
     # off avoids the whole class of bug. You'll need to manually restart
     # `python app.py` after editing the code, but the server no longer
     # crashes on its own.
-    init_db()
-    start_bulk_refresh_thread()
     app.run(debug=False, use_reloader=False, host="0.0.0.0", port=int(os.environ.get("PORT", "5000")))

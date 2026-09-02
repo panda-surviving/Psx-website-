@@ -57,7 +57,8 @@ cached so reopening the tab shows results instantly.
 ### New: Forex & Crypto Technicals
 
 Ported over from PSX Toolkit. Scans major forex pairs (plus gold and
-silver) and 45 major cryptocurrencies by market cap for:
+silver) and 18 major cryptocurrencies (the ones Yahoo Finance's free feed
+actually carries intraday bars for) for:
 - RSI(14)
 - Bullish / bearish RSI divergence
 - Trend-structure classification (higher highs/lows, lower highs/lows, etc.)
