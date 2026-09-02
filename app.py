@@ -2394,7 +2394,7 @@ def _start_technicals_warm(symbols):
         global _technicals_warm_in_progress
         try:
             try:
-                _prefetch_psx_histories_batch(symbols, period="5y", batch_size=50, max_workers=3)
+                _prefetch_psx_histories_batch(symbols, period="2y", batch_size=50, max_workers=3)
             except Exception:
                 pass
             refresh_technicals_cache(symbols)
@@ -3710,7 +3710,7 @@ def screener_run():
         # this request returns immediately using whatever is cached so far.
         SYNC_MISSING_LIMIT = 80
         if missing and len(missing) <= SYNC_MISSING_LIMIT:
-            _prefetch_psx_histories_batch(missing, period="5y", batch_size=50, max_workers=3)
+            _prefetch_psx_histories_batch(missing, period="2y", batch_size=50, max_workers=3)
 
             def one(symbol):
                 try:
@@ -4644,6 +4644,53 @@ def resample_ohlc(df, rule):
     return out.reset_index()
 
 
+def fetch_yf_ohlc_batch(symbols, interval, period, max_retries=3):
+    """Fetch OHLCV for many Yahoo tickers in one request instead of one
+    request per symbol.
+
+    Forex/Crypto Technicals used to call fetch_yf_ohlc() once per
+    (symbol, timeframe) pair in a tight loop with no delay - e.g. 18
+    coins x 3 timeframes = 54 back-to-back single-ticker requests. Yahoo's
+    free endpoint rate-limits that pattern by silently returning an empty
+    response (no error raised) rather than a clean 429, which surfaced as
+    "No data returned" even for EUR/USD - the most liquid pair there is,
+    and definitely not a symbol Yahoo lacks data for. Batching every
+    symbol for a given timeframe into a single yf.download() call cuts
+    the request count from N to 1 and avoids the pattern that triggers
+    the throttling.
+    """
+    import yfinance as yf
+
+    symbols = list(dict.fromkeys(symbols))  # de-dupe, keep order
+    if not symbols:
+        return {}
+
+    last_exc = None
+    frame = None
+    for attempt in range(max_retries):
+        try:
+            frame = yf.download(
+                tickers=symbols, interval=interval, period=period,
+                group_by="ticker", auto_adjust=True, progress=False, threads=True,
+            )
+            break
+        except Exception as e:
+            last_exc = e
+            if attempt < max_retries - 1:
+                time.sleep(2 * (2 ** attempt))
+                continue
+            raise
+    if frame is None or frame.empty:
+        raise RuntimeError(f"No data returned for batch of {len(symbols)} symbols at interval={interval}." + (f" ({last_exc})" if last_exc else ""))
+
+    out = {}
+    for sym in symbols:
+        df = _normalize_yahoo_batch_frame(frame, sym)
+        if df is not None and len(df) >= 2:
+            out[sym] = df[["date", "open", "high", "low", "close"]]
+    return out
+
+
 def analyze_intraday_symbol(df):
     if df is None or len(df) < INTRADAY_STRUCTURE_LOOKBACK:
         return {"error": f"Not enough bars ({0 if df is None else len(df)}) for analysis."}
@@ -4679,15 +4726,30 @@ def analyze_intraday_symbol(df):
 
 
 def run_intraday_technical_scan(symbol_list, timeframes, progress_cb=None):
-    """timeframes: list of (label, yf_interval, yf_period, resample_rule_or_None)."""
+    """timeframes: list of (label, yf_interval, yf_period, resample_rule_or_None).
+
+    Fetches every symbol's history for a given timeframe in ONE batched
+    Yahoo request rather than one request per symbol (see
+    fetch_yf_ohlc_batch) - both far fewer requests (fast) and far less
+    likely to trip Yahoo's rate limiting (reliable)."""
     results = {label: [] for label, *_ in timeframes}
     total = len(symbol_list) * len(timeframes)
     done = 0
+    tickers = [sym["yf"] for sym in symbol_list]
 
-    for sym in symbol_list:
-        for label, interval, period, resample_rule in timeframes:
+    for label, interval, period, resample_rule in timeframes:
+        try:
+            batch = fetch_yf_ohlc_batch(tickers, interval, period)
+            batch_error = None
+        except Exception as e:
+            batch = {}
+            batch_error = str(e)
+
+        for sym in symbol_list:
             try:
-                df = fetch_yf_ohlc(sym["yf"], interval=interval, period=period)
+                df = batch.get(sym["yf"])
+                if df is None:
+                    raise RuntimeError(batch_error or f"No data returned for {sym['yf']} at interval={interval}.")
                 if resample_rule:
                     df = resample_ohlc(df, resample_rule)
                 analysis = analyze_intraday_symbol(df)
@@ -4709,6 +4771,30 @@ _tech_jobs = {}
 _tech_jobs_lock = threading.Lock()
 _tech_scan_cache = {}  # name -> {"data": ..., "saved_at": iso string}
 _tech_scan_cache_lock = threading.Lock()
+
+# Render's free tier runs one worker process with limited CPU/RAM. Each of
+# PSX Divergence Screener / Forex Technicals / Crypto Technicals is already
+# a market-wide, multi-timeframe scan; launching several of them at once
+# (e.g. a user clicking through those tabs back to back) piles up
+# concurrent pandas/network work on that single constrained process, which
+# is a very plausible cause of the whole app becoming unresponsive (502/503
+# from Render's proxy) mid-scan. Only one such heavy scan runs at a time;
+# a second request is told to wait instead of stacking on top.
+_heavy_scan_lock = threading.Lock()
+_heavy_scan_active_name = [None]
+
+
+def _try_start_heavy_scan(name):
+    with _heavy_scan_lock:
+        if _heavy_scan_active_name[0] is not None:
+            return False
+        _heavy_scan_active_name[0] = name
+        return True
+
+
+def _finish_heavy_scan():
+    with _heavy_scan_lock:
+        _heavy_scan_active_name[0] = None
 
 
 def _new_tech_job():
@@ -4762,6 +4848,9 @@ def _load_tech_cache(name):
 
 def _run_tech_job_in_background(job_id, cache_name, symbols, timeframes):
     def worker():
+        if not _try_start_heavy_scan(cache_name):
+            _update_tech_job(job_id, status="error", error="Another market-wide scan (PSX Divergence / Forex / Crypto Technicals) is already running. Please wait for it to finish and try again.")
+            return
         try:
             def progress_cb(d, t, label):
                 _update_tech_job(job_id, progress={"done": d, "total": t, "symbol": label})
@@ -4770,6 +4859,8 @@ def _run_tech_job_in_background(job_id, cache_name, symbols, timeframes):
             _update_tech_job(job_id, status="done", result=result)
         except Exception as e:
             _update_tech_job(job_id, status="error", error=str(e))
+        finally:
+            _finish_heavy_scan()
     threading.Thread(target=worker, daemon=True).start()
 
 
@@ -5232,7 +5323,7 @@ def _analyze_one_psx_divergence_symbol(symbol, start_date):
 # PSX throttles repeated historical POSTs fairly aggressively. Four workers
 # keeps the scan materially faster than serial requests without creating the
 # burst of simultaneous connections that caused the original timeout failures.
-PSX_DIVERGENCE_SCAN_WORKERS = 8
+PSX_DIVERGENCE_SCAN_WORKERS = 4
 PSX_DIVERGENCE_HISTORY_CACHE_HOURS = 24
 _psx_divergence_history_cache = {}
 _psx_divergence_history_cache_lock = threading.Lock()
@@ -5275,7 +5366,7 @@ def _normalize_yahoo_batch_frame(frame, ticker):
         return None
 
 
-def _prefetch_psx_histories_batch(symbols, period="5y", batch_size=50, max_workers=3):
+def _prefetch_psx_histories_batch(symbols, period="2y", batch_size=50, max_workers=3):
     """Warm the in-process PSX history cache with batched Yahoo .KA downloads.
 
     A market-wide divergence/technical scan should not issue one HTTP request
@@ -5435,7 +5526,7 @@ def run_psx_divergence_scan(progress_cb=None):
     prefetch_started = time.time()
     if progress_cb:
         progress_cb(0, total, "Preparing batched PSX history…")
-    prefetched = _prefetch_psx_histories_batch(tickers, period="5y", batch_size=50, max_workers=3)
+    prefetched = _prefetch_psx_histories_batch(tickers, period="2y", batch_size=50, max_workers=3)
     prefetch_seconds = round(time.time() - prefetch_started, 2)
     if progress_cb:
         progress_cb(0, total, f"History cache warmed for {prefetched}/{total} symbols")
@@ -5522,6 +5613,9 @@ def run_psx_divergence_scan(progress_cb=None):
 
 def _run_psx_divergence_job_in_background(job_id):
     def worker():
+        if not _try_start_heavy_scan("psxdivergence"):
+            _update_tech_job(job_id, status="error", error="Another market-wide scan (PSX Divergence / Forex / Crypto Technicals) is already running. Please wait for it to finish and try again.")
+            return
         try:
             def progress_cb(done, tot, sym):
                 _update_tech_job(job_id, progress={"done": done, "total": tot, "symbol": sym})
@@ -5530,6 +5624,8 @@ def _run_psx_divergence_job_in_background(job_id):
             _update_tech_job(job_id, status="done", result=result)
         except Exception as e:
             _update_tech_job(job_id, status="error", error=str(e))
+        finally:
+            _finish_heavy_scan()
     threading.Thread(target=worker, daemon=True).start()
 
 
