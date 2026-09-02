@@ -3695,6 +3695,18 @@ def screener_run():
         return safe_jsonify(data)
     items = bulk["items"]
 
+    # Scoping to a starting letter shrinks the universe before the
+    # expensive technical-criteria step below, not just the final result
+    # list - e.g. "starts with A" cuts ~561 symbols down to a few dozen,
+    # which comfortably fits under SYNC_MISSING_LIMIT and returns fast
+    # even on a completely cold cache, instead of every run touching the
+    # whole market.
+    prefix = (criteria.get("symbol_prefix") or "").strip().upper()
+    if prefix == "#":
+        items = [q for q in items if str(q.get("symbol") or "")[:1].isdigit()]
+    elif prefix:
+        items = [q for q in items if str(q.get("symbol") or "").upper().startswith(prefix)]
+
     technicals_warming = False
     if TECHNICAL_CRITERIA_KEYS & set(criteria.keys()):
         symbols = [q.get("symbol") for q in items if q.get("symbol")]
@@ -4673,13 +4685,20 @@ def fetch_yf_ohlc_batch(symbols, interval, period, max_retries=3):
                 tickers=symbols, interval=interval, period=period,
                 group_by="ticker", auto_adjust=True, progress=False, threads=True,
             )
-            break
+            # A rate-limited request from Yahoo often comes back as a
+            # successful call with an EMPTY frame rather than an
+            # exception - the previous version treated that as final and
+            # never retried, which is exactly what turned a transient
+            # throttle into "no data returned" for an entire scan. Retry
+            # this the same as a raised exception, with backoff, so a
+            # short cooldown gives Yahoo's limiter time to reset.
+            if frame is not None and not frame.empty:
+                break
+            last_exc = RuntimeError("empty response")
         except Exception as e:
             last_exc = e
-            if attempt < max_retries - 1:
-                time.sleep(2 * (2 ** attempt))
-                continue
-            raise
+        if attempt < max_retries - 1:
+            time.sleep(3 * (2 ** attempt))
     if frame is None or frame.empty:
         raise RuntimeError(f"No data returned for batch of {len(symbols)} symbols at interval={interval}." + (f" ({last_exc})" if last_exc else ""))
 
@@ -4737,13 +4756,29 @@ def run_intraday_technical_scan(symbol_list, timeframes, progress_cb=None):
     done = 0
     tickers = [sym["yf"] for sym in symbol_list]
 
+    # Crypto's "1h" and "4h" both pull the same 60m interval/period from
+    # Yahoo (4h is just a local resample of the 60m bars) - fetch each
+    # distinct (interval, period) pair only once per scan instead of
+    # re-requesting identical data and doubling the chance of hitting
+    # Yahoo's rate limit for no reason.
+    fetch_cache = {}
+    first_fetch = True
+
     for label, interval, period, resample_rule in timeframes:
-        try:
-            batch = fetch_yf_ohlc_batch(tickers, interval, period)
-            batch_error = None
-        except Exception as e:
-            batch = {}
-            batch_error = str(e)
+        fetch_key = (interval, period)
+        if fetch_key in fetch_cache:
+            batch, batch_error = fetch_cache[fetch_key]
+        else:
+            if not first_fetch:
+                time.sleep(3)
+            first_fetch = False
+            try:
+                batch = fetch_yf_ohlc_batch(tickers, interval, period)
+                batch_error = None
+            except Exception as e:
+                batch = {}
+                batch_error = str(e)
+            fetch_cache[fetch_key] = (batch, batch_error)
 
         for sym in symbol_list:
             try:
@@ -5495,7 +5530,7 @@ def get_symbols_for_full_scan():
         raise RuntimeError("Unable to obtain a complete PSX universe; scan was NOT run on the 10-symbol development fallback.") from exc
 
 
-def run_psx_divergence_scan(progress_cb=None):
+def run_psx_divergence_scan(progress_cb=None, prefix=None):
     """Market-wide PSX scan: near-52-week-low, bullish/bearish RSI
     divergence, and trend structure, for every listed symbol. Returns a
     dict of named result lists rather than writing CSV/HTML files (this
@@ -5516,6 +5551,10 @@ def run_psx_divergence_scan(progress_cb=None):
     # it must never fall back to the 10 development symbols.
     tickers_meta = get_symbols_for_full_scan()
     tickers = [s["symbol"] for s in tickers_meta]
+    if prefix == "#":
+        tickers = [s for s in tickers if s[:1].isdigit()]
+    elif prefix:
+        tickers = [s for s in tickers if s.upper().startswith(prefix.upper())]
     if not tickers:
         raise RuntimeError("PSX did not return a symbol list.")
 
@@ -5611,16 +5650,17 @@ def run_psx_divergence_scan(progress_cb=None):
     }
 
 
-def _run_psx_divergence_job_in_background(job_id):
+def _run_psx_divergence_job_in_background(job_id, prefix=None):
+    cache_name = f"psxdivergence:{prefix}" if prefix else "psxdivergence"
     def worker():
-        if not _try_start_heavy_scan("psxdivergence"):
+        if not _try_start_heavy_scan(cache_name):
             _update_tech_job(job_id, status="error", error="Another market-wide scan (PSX Divergence / Forex / Crypto Technicals) is already running. Please wait for it to finish and try again.")
             return
         try:
             def progress_cb(done, tot, sym):
                 _update_tech_job(job_id, progress={"done": done, "total": tot, "symbol": sym})
-            result = run_psx_divergence_scan(progress_cb=progress_cb)
-            _save_tech_cache("psxdivergence", result)
+            result = run_psx_divergence_scan(progress_cb=progress_cb, prefix=prefix)
+            _save_tech_cache(cache_name, result)
             _update_tech_job(job_id, status="done", result=result)
         except Exception as e:
             _update_tech_job(job_id, status="error", error=str(e))
@@ -5634,18 +5674,25 @@ def api_psx_divergence_scan_start():
     guard = _technicals_guard()
     if guard:
         return guard
+    # Scoping the scan to symbols starting with one letter (or "#" for a
+    # leading digit) cuts a ~561-symbol, several-minute market-wide scan
+    # down to a few dozen symbols and a much smaller memory/CPU footprint
+    # on Render's single free-tier worker - both faster and far less
+    # likely to exhaust the process mid-scan.
+    prefix = (request.args.get("prefix") or "").strip().upper() or None
+    cache_name = f"psxdivergence:{prefix}" if prefix else "psxdivergence"
     try:
         # Show the most recent full-market result immediately when one exists,
         # while a fresh scan runs in the background. This prevents the UI from
         # appearing frozen for several minutes on a Render free-tier wake-up.
-        cached = _load_tech_cache("psxdivergence")
+        cached = _load_tech_cache(cache_name)
         job_id = _new_tech_job()
-        _run_psx_divergence_job_in_background(job_id)
-        payload = {"ok": True, "job_id": job_id, "message": "Market-wide PSX scan started."}
+        _run_psx_divergence_job_in_background(job_id, prefix=prefix)
+        payload = {"ok": True, "job_id": job_id, "message": f"PSX scan started{f' (symbols starting with {prefix})' if prefix else ''}."}
         if cached and cached.get("data"):
             payload["cached_result"] = cached["data"]
             payload["cached_saved_at"] = cached.get("saved_at")
-            payload["message"] = "Showing the last full-market scan immediately while a fresh scan runs in the background."
+            payload["message"] = "Showing the last scan immediately while a fresh scan runs in the background."
         response = safe_jsonify(payload)
         response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
         return response
@@ -6064,6 +6111,19 @@ def stock_chart(symbol):
     if full_df is None or full_df.empty:
         return safe_jsonify({"available": False, "symbol": symbol.upper(), "timeframe": timeframe, "note": "No real OHLCV history is available for this timeframe."})
 
+    # A single corrupt/mis-parsed future-dated row from an upstream source
+    # was enough to break every timeframe: the "latest bar" anchors the
+    # visible window (see the cutoff math below), so one bad row dated
+    # months ahead pulled the whole chart's window into the future along
+    # with it - what showed up as a "1D" chart full of December candles
+    # while it was still September. A completed trading candle can never
+    # be dated in the future, so drop anything past a small clock-skew
+    # buffer before it can influence the window at all.
+    future_cutoff = pd.Timestamp.now() + pd.Timedelta(days=2)
+    full_df = full_df[full_df["date"] <= future_cutoff]
+    if full_df.empty:
+        return safe_jsonify({"available": False, "symbol": symbol.upper(), "timeframe": timeframe, "note": "No real OHLCV history is available for this timeframe."})
+
     full_df = full_df.sort_values("date").reset_index(drop=True)
 
     # Pivot levels always use the latest completed real bar from the same
@@ -6154,9 +6214,20 @@ def fetch_crypto_ohlc_history(symbol, interval, period):
         raise ValueError(f"Invalid crypto symbol: {symbol!r}")
     ticker = f"{symbol}-USD"
 
-    df = yf.download(ticker, interval=interval, period=period, progress=False, auto_adjust=False)
+    df = None
+    last_exc = None
+    for attempt in range(3):
+        try:
+            df = yf.download(ticker, interval=interval, period=period, progress=False, auto_adjust=False)
+        except Exception as e:
+            df = None
+            last_exc = e
+        if df is not None and not df.empty:
+            break
+        if attempt < 2:
+            time.sleep(3 * (2 ** attempt))
     if df is None or df.empty:
-        raise RuntimeError(f"No data returned for {ticker} at interval={interval}.")
+        raise RuntimeError(f"No data returned for {ticker} at interval={interval}." + (f" ({last_exc})" if last_exc else ""))
 
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
@@ -6207,6 +6278,11 @@ def crypto_chart(symbol):
         df = get_crypto_chart_cached(symbol, cfg["interval"], cfg["period"])
     except Exception as e:
         return safe_jsonify({"available": False, "symbol": symbol.upper(), "timeframe": timeframe, "note": f"Real candles are unavailable from Yahoo Finance for this coin right now: {e}"})
+
+    future_cutoff = pd.Timestamp.now() + pd.Timedelta(days=2)
+    df = df[df["date"] <= future_cutoff]
+    if df.empty:
+        return safe_jsonify({"available": False, "symbol": symbol.upper(), "timeframe": timeframe, "note": "No real OHLCV history is available for this timeframe."})
 
     is_intraday = cfg["interval"] in CRYPTO_CHART_INTRADAY_INTERVALS
     candles, volume = _ohlc_to_candles_and_volume(df, is_intraday)

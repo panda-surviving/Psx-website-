@@ -1611,6 +1611,11 @@ async function loadExtras() {
   }
 
   if ($("announcementList")) {
+    // Never fall back to placeholder/example announcement text - that
+    // looked like real PSX filings but was hardcoded filler ("Corporate /
+    // company update", "Recent"). Show real announcements or an honest
+    // empty/error state, the same way every other live-data panel in
+    // this app behaves.
     try {
       const live = await getJSON("/api/psx/financials?limit=60");
       const rows = (live.announcements || []).map(item => `
@@ -1619,13 +1624,9 @@ async function loadExtras() {
           <div><strong>${esc(item.title)}</strong><small>Official PSX filing</small></div>
         </a>
       `).join("");
-      $("announcementList").innerHTML = rows || d.announcements.map(item => `
-        <div class="announcement-card"><div class="announcement-symbol">${esc(item.symbol)}</div><div><strong>${esc(item.title)}</strong><small>${esc(item.time)}</small></div></div>
-      `).join("");
+      $("announcementList").innerHTML = rows || `<div class="empty-chart">No live PSX announcements available right now.</div>`;
     } catch (e) {
-      $("announcementList").innerHTML = d.announcements.map(item => `
-        <div class="announcement-card"><div class="announcement-symbol">${esc(item.symbol)}</div><div><strong>${esc(item.title)}</strong><small>${esc(item.time)}</small></div></div>
-      `).join("");
+      $("announcementList").innerHTML = `<div class="error-panel">Could not load PSX announcements: ${esc(e.message)}</div>`;
     }
   }
 }
@@ -3750,6 +3751,9 @@ function collectScreenerCriteria() {
     return v === "" ? null : Number(v);
   };
 
+  const prefix = $("f_symbol_prefix")?.value?.trim();
+  if (prefix) criteria.symbol_prefix = prefix;
+
   criteria.price_min = num("f_price_min");
   criteria.price_max = num("f_price_max");
   criteria.change_pct_min = num("f_change_min");
@@ -3786,6 +3790,7 @@ function renderActiveFilterChips(criteria) {
     week52_position: v => `52-week position: ${v.replace("_"," ")}`,
     sectors: v => `Sector: ${v.join(", ")}`,
     above_ldcp: () => `Above yesterday's close`,
+    symbol_prefix: v => v === "#" ? `Symbol starts with a digit` : `Symbol starts with "${v}"`,
   };
 
   const chips = Object.entries(criteria)
@@ -4114,9 +4119,10 @@ async function runPsxDivergenceScan() {
   const resultsEl = $("psxDivergenceResults");
   const runBtn = $("psxDivergenceRunBtn");
   if (runBtn) runBtn.disabled = true;
-  statusEl.textContent = "Starting market-wide scan…";
+  const prefix = $("psxDivergencePrefix")?.value || "";
+  statusEl.textContent = prefix ? `Starting scan (symbols starting with ${prefix === "#" ? "a digit" : prefix})…` : "Starting market-wide scan…";
   try {
-    const startData = await getJSON("/api/psxdivergence/scan/start");
+    const startData = await getJSON(`/api/psxdivergence/scan/start${prefix ? `?prefix=${encodeURIComponent(prefix)}` : ""}`);
     if (!startData.ok) { statusEl.textContent = "Error: " + startData.error; return; }
 
     if (startData.cached_result) {
