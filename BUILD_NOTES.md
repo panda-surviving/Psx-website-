@@ -70,3 +70,15 @@ The chart now reports its data source, uses real OHLCV, and the stock-detail tec
 - Sanitized malformed OHLC extrema to prevent the abnormal vertical candle wicks shown in the production screenshot.
 - Made stock-detail JSON resilient to intraday provider exceptions.
 - Bumped service-worker and static JS cache versions to v4.
+
+## V15 corrective build — 2026-09-03
+
+- Restored four persistent global ticker rows: PSX, Crypto, Forex, Mutual Funds. Each provider updates independently so one slow feed cannot remove the others.
+- PSX quote cold-start is now non-blocking. The browser gets the last persisted Market Watch session immediately; a background refresh obtains the next real Market Watch snapshot. No fabricated quote is returned.
+- Removed automatic full-universe technical-history warming from every 10-minute PSX quote refresh. This was generating hundreds of upstream requests and could starve the Render web worker / produce 503s.
+- PSX market state now follows the official regular-market schedule: Mon–Thu 09:32–15:30; Friday 09:17–12:00 and 14:32–16:30, with closed-session messaging showing the last completed Market Watch session.
+- PSX 1H/5H charts now aggregate genuine PSX intraday trade-price observations. 1H is one real one-hour candle; 5H is a true five-session-hour candle anchored at 09:30. No daily-to-hourly fabrication.
+- Chart timeframe semantics corrected: 1D = one candle per trading day; 5D = five-day candle; 1M/3M/6M/1Y/3Y/5Y = candles aggregated to those periods; ALL = genuine daily candles across available history.
+- MUFAP cold start now attempts a bounded live NAV fetch and the frontend polls briefly if the complete real directory arrives before live NAVs. NAVs remain sourced from MUFAP, never invented.
+- PSX announcements now use the confirmed POST announcement feed first, with company-page fallback. News and announcements therefore consume the actual PSX filing stream instead of static placeholder cards.
+- Static asset/service-worker cache bumped to V15.

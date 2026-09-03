@@ -1531,7 +1531,7 @@ function setRing(ringId, scoreId, labelId, score, label) {
 }
 
 async function loadExtras() {
-  const d = await getJSON("/api/extras"); let liveAnnouncements=[]; try { liveAnnouncements=(await getJSON("/api/psx/announcements?limit=20")).announcements||[]; } catch(e) {}
+  const d = await getJSON("/api/extras");
 
   if ($("sectorList")) {
     const sortMode = $("sectorSort")?.value || "default";
@@ -1731,14 +1731,7 @@ setupHeaderSearch();
 setupMobileNav();
 renderStaticCharts();
 
-loadPortfolio();
-loadMarket();
-loadWatchlist();
-loadSymbols();
-loadExtras();
-loadMarket360();
-loadDashboardHighlights();
-loadDashboardTickers();
+Promise.allSettled([loadPortfolio(),loadMarket(),loadWatchlist(),loadSymbols(),loadExtras(),loadMarket360(),loadDashboardHighlights(),loadDashboardTickers()]);
 
 
 function renderSentiment(data) {
@@ -2216,9 +2209,17 @@ function renderMarket360Detail(d, extras, suffix) {
 
   // News / announcements / payouts (extras passed in from the caller,
   // fetched once and reused for both the Markets page and Dashboard).
-  const announcementRows=liveAnnouncements;
-  $("marketAnnouncementList" + suffix).innerHTML=announcementRows.map(item=>`<a class="announcement-card clickable-row" href="${esc(item.url)}" target="_blank" rel="noopener"><div class="announcement-symbol">${esc(item.symbol||"PSX")}</div><div><strong>${esc(item.title)}</strong><small>${esc(item.date||"")} ${esc(item.time||"")}</small></div></a>`).join("") || `<div class="empty-chart">No live PSX announcements available right now.</div>`;
-  $("marketNewsList" + suffix).innerHTML=announcementRows.map(item=>`<a class="mover-row" href="${esc(item.url)}" target="_blank" rel="noopener"><div><strong>${esc(item.title)}</strong><small>${esc(item.symbol||"PSX")} · ${esc(item.date||"")} ${esc(item.time||"")}</small></div></a>`).join("") || `<div class="empty-chart">No live PSX news/filings available right now.</div>`;
+  $("marketAnnouncementList" + suffix).innerHTML = extras.announcements.map(item => `
+    <div class="announcement-card">
+      <div class="announcement-symbol">${esc(item.symbol)}</div>
+      <div><strong>${esc(item.title)}</strong><small>${esc(item.time)}</small></div>
+    </div>
+  `).join("");
+  $("marketNewsList" + suffix).innerHTML = extras.announcements.map(item => `
+    <div class="mover-row">
+      <div><strong>${esc(item.title)}</strong><small>${esc(item.symbol)} · ${esc(item.time)}</small></div>
+    </div>
+  `).join("") || `<div class="empty-chart">No news cached yet.</div>`;
 
   $("upcomingPayouts" + suffix).innerHTML = d.upcoming_payouts.map(item => `
     <div class="mover-row">
@@ -2980,6 +2981,17 @@ async function loadMutualFunds() {
     const d = await getJSON("/api/mutual-funds");
     allFunds = d.funds;
     renderMutualFunds(d);
+    // A cold deployment may initially return the complete real MUFAP
+    // directory while the live NAV refresh is still running. Poll briefly
+    // so NAVs replace dashes automatically as soon as MUFAP responds.
+    if (!String(d.source || "").toLowerCase().includes("live nav") && allFunds.every(f => f.nav == null)) {
+      setTimeout(async () => {
+        try {
+          const fresh = await getJSON("/api/mutual-funds", {timeoutMs:8000});
+          if (fresh.funds?.some(f => f.nav != null)) { allFunds=fresh.funds; renderMutualFunds(fresh); }
+        } catch (_) {}
+      }, 5000);
+    }
   } catch (error) {
     $("mutualFundsSource").textContent = "Unable to load funds.";
     $("mutualFundsTable").innerHTML = `<tr><td colspan="7"><div class="error-panel">${esc(error.message)}</div></td></tr>`;
@@ -3482,40 +3494,42 @@ function buildTickerStrip(label, items) {
   `;
 }
 
+function renderGlobalTickerShell() {
+  const el=$("globalTickerBar");
+  if (!el) return;
+  if (el.dataset.ready === "1") return;
+  el.dataset.ready="1";
+  el.innerHTML=[
+    '<div class="ticker-strip"><span class="ticker-strip-label">PSX</span><span id="tickerPsxTrack" class="ticker-track"><span class="ticker-item">Loading PSX market data…</span></span></div>',
+    '<div class="ticker-strip"><span class="ticker-strip-label">CRYPTO LIVE</span><span id="tickerCryptoTrack" class="ticker-track"><span class="ticker-item">Loading crypto…</span></span></div>',
+    '<div class="ticker-strip"><span class="ticker-strip-label">FOREX LIVE</span><span id="tickerForexTrack" class="ticker-track"><span class="ticker-item">Loading forex…</span></span></div>',
+    '<div class="ticker-strip"><span class="ticker-strip-label">MUTUAL FUNDS</span><span id="tickerFundsTrack" class="ticker-track"><span class="ticker-item">Loading NAVs…</span></span></div>'
+  ].join("");
+}
+
+function renderTickerTrack(id, items, emptyText) {
+  const el=$(id); if(!el) return;
+  if(!items.length){ el.innerHTML=`<span class="ticker-item">${esc(emptyText)}</span>`; return; }
+  const doubled=[...items,...items];
+  el.innerHTML=doubled.map(i=>`<span class="ticker-item"><b>${esc(i.symbol)}</b> ${i.price} ${i.pct==null?"":`<span class="${i.pct>=0?"positive":"negative"}">${i.pct>=0?"▲":"▼"}${Math.abs(i.pct).toFixed(2)}%</span>`}</span>`).join("");
+}
+
 async function loadDashboardTickers() {
-  if (!$("globalTickerBar")) return;
-
-  try {
-    const [stocks, crypto, forex, funds] = await Promise.all([
-      getJSON("/api/stocks/live").catch(() => ({ items: [] })),
-      getJSON("/api/crypto/live").catch(() => ({ coins: [] })),
-      getJSON("/api/forex/live").catch(() => ({ rates: {} })),
-      getJSON("/api/mutual-funds").catch(() => ({ funds: [] })),
-    ]);
-
-    const psxSource=stocks.items.filter(s=>s.price!=null); const psxRanked=stocks.market_state==="LIVE" ? psxSource.slice().sort((a,b)=>Math.abs(Number(b.change_pct||0))-Math.abs(Number(a.change_pct||0))) : psxSource.slice().sort((a,b)=>Number(b.volume||0)-Number(a.volume||0));
-    const psxItems=psxRanked.slice(0,15).map(s=>({symbol:s.symbol,price:Number(s.price).toFixed(2),pct:Number(s.change_pct||0)}));
-
-    const cryptoItems = crypto.coins.slice(0, 15)
-      .map(c => ({ symbol: c.symbol, price: "$" + Number(c.current_price).toLocaleString(undefined, {maximumFractionDigits: c.current_price < 1 ? 4 : 2}), pct: Number(c.price_change_percentage_24h || 0) }));
-
-    const forexItems = Object.entries(forex.rates).slice(0, 15)
-      .map(([code, rate]) => ({ symbol: `USD/${code}`, price: Number(rate).toFixed(3), pct: 0 }));
-
-    const fundItems = funds.funds.filter(f => f.nav != null).slice(0, 15)
-      .map(f => ({ symbol: f.name.slice(0, 22), price: Number(f.nav).toFixed(2), pct: Number(f.ytd || 0) }));
-
-    const psxLabel = stocks.market_state === "CLOSED" ? "PSX • CLOSED • LAST SESSION" : (stocks.market_state === "LIVE" ? "PSX LIVE" : "PSX LIVE • FEED UNAVAILABLE");
-    const psxStrip = psxItems.length ? buildTickerStrip(psxLabel, psxItems) : `<div class="ticker-strip"><span class="ticker-strip-label">${esc(psxLabel)}</span><span class="ticker-item">${esc(stocks.market_message || "PSX bulk quote snapshot is temporarily unavailable — retrying…")}</span></div>`;
-    $("globalTickerBar").innerHTML = [
-      psxStrip,
-      cryptoItems.length ? buildTickerStrip("CRYPTO LIVE", cryptoItems) : "",
-      forexItems.length ? buildTickerStrip("FOREX LIVE", forexItems) : "",
-      fundItems.length ? buildTickerStrip("MUTUAL FUNDS", fundItems) : "",
-    ].join("");
-  } catch (error) {
-    // Ticker strips are a non-critical enhancement.
-  }
+  renderGlobalTickerShell();
+  // Each strip is independent: one slow provider can no longer hide the
+  // other three bars or delay the whole header for 20–30 seconds.
+  const tasks=[
+    getJSON("/api/stocks/live",{timeoutMs:8000}).then(stocks=>{
+      const psxItems=(stocks.items||[]).filter(s=>s.price!=null).slice(0,15).map(s=>({symbol:s.symbol,price:`Rs ${Number(s.price).toFixed(2)}`,pct:Number(s.change_pct||0)}));
+      renderTickerTrack("tickerPsxTrack",psxItems,stocks.market_message||"Waiting for PSX Market Watch…");
+      const label=document.querySelector('#globalTickerBar .ticker-strip:first-child .ticker-strip-label');
+      if(label) label.textContent=stocks.market_state==="CLOSED"?"PSX • CLOSED • LAST SESSION":stocks.market_state==="LIVE"?"PSX LIVE":"PSX";
+    }).catch(()=>{}),
+    getJSON("/api/crypto/live",{timeoutMs:8000}).then(d=>renderTickerTrack("tickerCryptoTrack",(d.coins||[]).slice(0,15).map(c=>({symbol:(c.symbol||"").toUpperCase(),price:`$${Number(c.current_price).toLocaleString(undefined,{maximumFractionDigits:c.current_price<1?4:2})}`,pct:Number(c.price_change_percentage_24h||0)})),"Crypto feed unavailable")).catch(()=>{}),
+    getJSON("/api/forex/live",{timeoutMs:8000}).then(d=>renderTickerTrack("tickerForexTrack",Object.entries(d.rates||{}).slice(0,15).map(([code,rate])=>({symbol:`USD/${code}`,price:Number(rate).toFixed(4),pct:null})),"Forex feed unavailable")).catch(()=>{}),
+    getJSON("/api/mutual-funds",{timeoutMs:8000}).then(d=>renderTickerTrack("tickerFundsTrack",(d.funds||[]).filter(f=>f.nav!=null).slice(0,15).map(f=>({symbol:(f.name||"").slice(0,22),price:`Rs ${Number(f.nav).toFixed(2)}`,pct:f.ytd==null?null:Number(f.ytd)})),"MUFAP NAVs loading…")).catch(()=>{})
+  ];
+  await Promise.allSettled(tasks);
 }
 
 async function loadDashboardHighlights() {
@@ -3772,8 +3786,6 @@ function collectScreenerCriteria() {
   return criteria;
 }
 
-document.querySelectorAll("#screenerAlphabet .screener-letter").forEach(btn=>btn.addEventListener("click",()=>{const p=btn.dataset.prefix||""; $("f_symbol_prefix").value=p; document.querySelectorAll("#screenerAlphabet .screener-letter").forEach(b=>b.classList.toggle("active",b===btn));}));
-
 function renderActiveFilterChips(criteria) {
   const labels = {
     price_min: v => `Price ≥ ${v}`, price_max: v => `Price ≤ ${v}`,
@@ -3850,7 +3862,7 @@ $("runScreenerBtn")?.addEventListener("click", runScreener);
 $("clearScreenerBtn")?.addEventListener("click", () => {
   ["f_price_min","f_price_max","f_change_min","f_change_max","f_pe_min","f_pe_max",
    "f_1y_min","f_ytd_min","f_volume_min"].forEach(id => { $(id).value = ""; });
-  $("f_week52_position").value = ""; $("f_symbol_prefix").value=""; document.querySelectorAll("#screenerAlphabet .screener-letter").forEach(b=>b.classList.toggle("active",b.dataset.prefix===""));
+  $("f_week52_position").value = "";
   $("f_sector").value = "";
   $("f_above_ldcp").checked = false;
   renderActiveFilterChips({});

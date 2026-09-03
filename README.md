@@ -64,7 +64,7 @@ actually carries intraday bars for) for:
 - Trend-structure classification (higher highs/lows, lower highs/lows, etc.)
 
 on 30-minute and 1-hour bars (forex) or 30m/1h/4h bars (crypto), using
-CoinGecko public market-price data (no API key needed). A scan
+free data from Yahoo Finance (`yfinance`, no API key needed). A scan
 takes a minute or two, so it runs in the background — the page polls for
 progress, and the last completed scan is cached so reopening the tab
 shows results instantly.
