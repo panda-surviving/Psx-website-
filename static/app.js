@@ -1531,7 +1531,7 @@ function setRing(ringId, scoreId, labelId, score, label) {
 }
 
 async function loadExtras() {
-  const d = await getJSON("/api/extras");
+  const d = await getJSON("/api/extras"); let liveAnnouncements=[]; try { liveAnnouncements=(await getJSON("/api/psx/announcements?limit=20")).announcements||[]; } catch(e) {}
 
   if ($("sectorList")) {
     const sortMode = $("sectorSort")?.value || "default";
@@ -2216,17 +2216,9 @@ function renderMarket360Detail(d, extras, suffix) {
 
   // News / announcements / payouts (extras passed in from the caller,
   // fetched once and reused for both the Markets page and Dashboard).
-  $("marketAnnouncementList" + suffix).innerHTML = extras.announcements.map(item => `
-    <div class="announcement-card">
-      <div class="announcement-symbol">${esc(item.symbol)}</div>
-      <div><strong>${esc(item.title)}</strong><small>${esc(item.time)}</small></div>
-    </div>
-  `).join("");
-  $("marketNewsList" + suffix).innerHTML = extras.announcements.map(item => `
-    <div class="mover-row">
-      <div><strong>${esc(item.title)}</strong><small>${esc(item.symbol)} · ${esc(item.time)}</small></div>
-    </div>
-  `).join("") || `<div class="empty-chart">No news cached yet.</div>`;
+  const announcementRows=liveAnnouncements;
+  $("marketAnnouncementList" + suffix).innerHTML=announcementRows.map(item=>`<a class="announcement-card clickable-row" href="${esc(item.url)}" target="_blank" rel="noopener"><div class="announcement-symbol">${esc(item.symbol||"PSX")}</div><div><strong>${esc(item.title)}</strong><small>${esc(item.date||"")} ${esc(item.time||"")}</small></div></a>`).join("") || `<div class="empty-chart">No live PSX announcements available right now.</div>`;
+  $("marketNewsList" + suffix).innerHTML=announcementRows.map(item=>`<a class="mover-row" href="${esc(item.url)}" target="_blank" rel="noopener"><div><strong>${esc(item.title)}</strong><small>${esc(item.symbol||"PSX")} · ${esc(item.date||"")} ${esc(item.time||"")}</small></div></a>`).join("") || `<div class="empty-chart">No live PSX news/filings available right now.</div>`;
 
   $("upcomingPayouts" + suffix).innerHTML = d.upcoming_payouts.map(item => `
     <div class="mover-row">
@@ -3501,8 +3493,8 @@ async function loadDashboardTickers() {
       getJSON("/api/mutual-funds").catch(() => ({ funds: [] })),
     ]);
 
-    const psxItems = stocks.items.filter(s => s.price != null).slice(0, 15)
-      .map(s => ({ symbol: s.symbol, price: Number(s.price).toFixed(2), pct: Number(s.change_pct || 0) }));
+    const psxSource=stocks.items.filter(s=>s.price!=null); const psxRanked=stocks.market_state==="LIVE" ? psxSource.slice().sort((a,b)=>Math.abs(Number(b.change_pct||0))-Math.abs(Number(a.change_pct||0))) : psxSource.slice().sort((a,b)=>Number(b.volume||0)-Number(a.volume||0));
+    const psxItems=psxRanked.slice(0,15).map(s=>({symbol:s.symbol,price:Number(s.price).toFixed(2),pct:Number(s.change_pct||0)}));
 
     const cryptoItems = crypto.coins.slice(0, 15)
       .map(c => ({ symbol: c.symbol, price: "$" + Number(c.current_price).toLocaleString(undefined, {maximumFractionDigits: c.current_price < 1 ? 4 : 2}), pct: Number(c.price_change_percentage_24h || 0) }));
@@ -3780,6 +3772,8 @@ function collectScreenerCriteria() {
   return criteria;
 }
 
+document.querySelectorAll("#screenerAlphabet .screener-letter").forEach(btn=>btn.addEventListener("click",()=>{const p=btn.dataset.prefix||""; $("f_symbol_prefix").value=p; document.querySelectorAll("#screenerAlphabet .screener-letter").forEach(b=>b.classList.toggle("active",b===btn));}));
+
 function renderActiveFilterChips(criteria) {
   const labels = {
     price_min: v => `Price ≥ ${v}`, price_max: v => `Price ≤ ${v}`,
@@ -3856,7 +3850,7 @@ $("runScreenerBtn")?.addEventListener("click", runScreener);
 $("clearScreenerBtn")?.addEventListener("click", () => {
   ["f_price_min","f_price_max","f_change_min","f_change_max","f_pe_min","f_pe_max",
    "f_1y_min","f_ytd_min","f_volume_min"].forEach(id => { $(id).value = ""; });
-  $("f_week52_position").value = "";
+  $("f_week52_position").value = ""; $("f_symbol_prefix").value=""; document.querySelectorAll("#screenerAlphabet .screener-letter").forEach(b=>b.classList.toggle("active",b.dataset.prefix===""));
   $("f_sector").value = "";
   $("f_above_ldcp").checked = false;
   renderActiveFilterChips({});

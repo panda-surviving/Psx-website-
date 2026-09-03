@@ -1263,7 +1263,7 @@
       <div class="screener-live-grid">
         <label>Symbol starts with
           <select id="f_symbol_prefix">
-            <option value="">All symbols (561)</option>
+            <option value="">All symbols</option>
             <option value="A">A</option><option value="B">B</option><option value="C">C</option>
             <option value="D">D</option><option value="E">E</option><option value="F">F</option>
             <option value="G">G</option><option value="H">H</option><option value="I">I</option>
@@ -1275,6 +1275,7 @@
             <option value="Y">Y</option><option value="Z">Z</option><option value="#">0-9</option>
           </select>
         </label>
+        <div class="screener-alphabet" id="screenerAlphabet" aria-label="Quick PSX screener alphabet filter"><button type="button" class="secondary screener-letter active" data-prefix="">ALL</button><button type="button" class="secondary screener-letter" data-prefix="#">0-9</button><button type="button" class="secondary screener-letter" data-prefix="A">A</button><button type="button" class="secondary screener-letter" data-prefix="B">B</button><button type="button" class="secondary screener-letter" data-prefix="C">C</button><button type="button" class="secondary screener-letter" data-prefix="D">D</button><button type="button" class="secondary screener-letter" data-prefix="E">E</button><button type="button" class="secondary screener-letter" data-prefix="F">F</button><button type="button" class="secondary screener-letter" data-prefix="G">G</button><button type="button" class="secondary screener-letter" data-prefix="H">H</button><button type="button" class="secondary screener-letter" data-prefix="I">I</button><button type="button" class="secondary screener-letter" data-prefix="J">J</button><button type="button" class="secondary screener-letter" data-prefix="K">K</button><button type="button" class="secondary screener-letter" data-prefix="L">L</button><button type="button" class="secondary screener-letter" data-prefix="M">M</button><button type="button" class="secondary screener-letter" data-prefix="N">N</button><button type="button" class="secondary screener-letter" data-prefix="O">O</button><button type="button" class="secondary screener-letter" data-prefix="P">P</button><button type="button" class="secondary screener-letter" data-prefix="Q">Q</button><button type="button" class="secondary screener-letter" data-prefix="R">R</button><button type="button" class="secondary screener-letter" data-prefix="S">S</button><button type="button" class="secondary screener-letter" data-prefix="T">T</button><button type="button" class="secondary screener-letter" data-prefix="U">U</button><button type="button" class="secondary screener-letter" data-prefix="V">V</button><button type="button" class="secondary screener-letter" data-prefix="W">W</button><button type="button" class="secondary screener-letter" data-prefix="X">X</button><button type="button" class="secondary screener-letter" data-prefix="Y">Y</button><button type="button" class="secondary screener-letter" data-prefix="Z">Z</button></div>
         <label>Price min<input type="number" id="f_price_min" placeholder="e.g. 50"></label>
         <label>Price max<input type="number" id="f_price_max" placeholder="e.g. 500"></label>
         <label>Change % min<input type="number" id="f_change_min" placeholder="e.g. 0"></label>
@@ -1721,7 +1722,7 @@
         <div class="card-head">
           <div>
             <h3>Price Graph</h3>
-            <p>Intraday series when available</p>
+            <p>Real PSX intraday ticks and historical daily candles</p>
           </div>
           <span id="detailSource" class="soft-chip">—</span>
         </div>
@@ -1746,7 +1747,7 @@
       <div class="card-head">
         <div>
           <h3>Interactive Chart</h3>
-          <p>Candlesticks with volume, moving averages, RSI and MACD — real PSX price history.</p>
+          <p>1H / 5H / 1D use real PSX intraday ticks; 5D+ use real PSX daily history.</p>
         </div>
       </div>
 

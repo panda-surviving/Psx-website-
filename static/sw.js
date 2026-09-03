@@ -1,4 +1,4 @@
-const CACHE = "psx-360-shell-v14";
+const CACHE = "psx-360-shell-v15";
 const APP_SHELL = ["/", "/static/style.css", "/static/app.js"];
 
 self.addEventListener("install", event => {

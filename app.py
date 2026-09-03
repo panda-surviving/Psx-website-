@@ -103,6 +103,10 @@ PSX_ALT_SYMBOLS_URL = f"{PSX_ALT_BASE}/symbols"
 PSX_ALT_COMPANY_URL = f"{PSX_ALT_BASE}/company/{{symbol}}"
 PSX_ALT_INTRADAY_URL = f"{PSX_ALT_BASE}/timeseries/int/{{symbol}}"
 PSX_ALT_ELIGIBLE_URL = f"{PSX_ALT_BASE}/eligible-scrips"
+PSX_EOD_URL = "https://dps.psx.com.pk/timeseries/eod/{symbol}"
+PSX_ALT_EOD_URL = f"{PSX_ALT_BASE}/timeseries/eod/{{symbol}}"
+PSX_ANNOUNCEMENTS_URL = "https://dps.psx.com.pk/announcements"
+PSX_ALT_ANNOUNCEMENTS_URL = f"{PSX_ALT_BASE}/announcements"
 YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}.KA"
 PSX_SCRAPER_API_BASE = os.environ.get("PSX_SCRAPER_API_BASE", "https://nifraa-psx-stock-intel.hf.space/api").rstrip("/")
 
@@ -186,6 +190,7 @@ _mufap_lock = threading.Lock()
 _mufap_refresh_lock = threading.Lock()
 MUFAP_CACHE_MINUTES = 30
 MUFAP_NAV_URL = "https://www.mufap.com.pk/Industry/IndustryStatDaily?tab=3"
+MUFAP_RETURNS_URL = "https://www.mufap.com.pk/Industry/IndustryStatDaily?tab=1"
 PSX_BULK_SCREENER_URL = "https://dps.psx.com.pk/screener"
 PSX_BULK_MARKET_WATCH_URL = "https://dps.psx.com.pk/market-watch"
 PSX_BULK_SNAPSHOT_CACHE_MINUTES = 5
@@ -1606,67 +1611,50 @@ def _parse_eligible_scrips_html(html):
     return out
 
 
+def _extract_api_rows(payload):
+    if isinstance(payload,list):
+        if all(isinstance(x,dict) for x in payload): return payload
+        out=[]
+        for x in payload: out.extend(_extract_api_rows(x))
+        return out
+    if isinstance(payload,dict):
+        for key in ("items","symbols","rows","data","result","records"):
+            if key in payload:
+                rows=_extract_api_rows(payload[key])
+                if rows: return rows
+    return []
+
+def _normalize_symbol_rows(payload):
+    out=[]; seen=set()
+    for row in _extract_api_rows(payload):
+        sym=str(row.get("symbol") or row.get("SYMBOL") or row.get("ticker") or "").strip().upper()
+        if not sym or sym in seen or not re.match(r"^[A-Z0-9&.\-]{1,30}$",sym): continue
+        if row.get("isDebt") or row.get("is_debt") or row.get("isETF") or row.get("is_etf"): continue
+        seen.add(sym); out.append({"symbol":sym,"company":str(row.get("name") or row.get("company") or row.get("company_name") or sym).strip(),"sector":str(row.get("sectorName") or row.get("sector") or row.get("sector_name") or "").strip()})
+    out.sort(key=lambda x:x["symbol"]); return out
+
 def fetch_psx_symbols(force=False):
-    now = datetime.now()
+    now=datetime.now()
     with _symbol_lock:
-        if (not force and _symbol_cache["items"] and _symbol_cache["time"]
-                and now - _symbol_cache["time"] < timedelta(minutes=SYMBOL_CACHE_MINUTES)):
-            return _symbol_cache["items"]
-
+        if not force and _symbol_cache["items"] and _symbol_cache["time"] and now-_symbol_cache["time"] < timedelta(minutes=SYMBOL_CACHE_MINUTES): return _symbol_cache["items"]
     errors=[]
-    # IMPORTANT: the official Eligible Scrips page is authoritative for the
-    # complete regular equity universe.  The /symbols endpoint can be a small
-    # development/quote directory on some PSX deployments, so it is never
-    # accepted as the complete universe unless it contains a large directory.
-    try:
-        r=_http_session.get(PSX_ALT_ELIGIBLE_URL, headers=HEADERS, timeout=20)
-        r.raise_for_status()
-        items=_parse_eligible_scrips_html(r.text)
-        if len(items) >= 100:
-            with _symbol_lock:
-                _symbol_cache.update({"items":items,"time":now})
-            return items
-    except Exception as exc:
-        errors.append(f"eligible: {exc}")
-
-    # Official primary PSX hostname as a second attempt.
-    try:
-        r=_http_session.get("https://dps.psx.com.pk/eligible-scrips", headers=HEADERS, timeout=20)
-        r.raise_for_status()
-        items=_parse_eligible_scrips_html(r.text)
-        if len(items) >= 100:
-            with _symbol_lock:
-                _symbol_cache.update({"items":items,"time":now})
-            return items
-    except Exception as exc:
-        errors.append(f"primary eligible: {exc}")
-
-    # JSON symbol directories are accepted only when they are demonstrably
-    # complete (100+ entries), otherwise they are treated as a partial feed.
-    for url in (PSX_SYMBOLS_URL, PSX_ALT_SYMBOLS_URL):
+    for url in (PSX_SYMBOLS_URL,PSX_ALT_SYMBOLS_URL):
         try:
-            r=_http_session.get(url, headers=HEADERS, timeout=15)
-            r.raise_for_status(); raw=r.json()
-            items=[]; seen=set()
-            for row in raw if isinstance(raw,list) else []:
-                if row.get("isDebt") or row.get("isETF"):
-                    continue
-                symbol=str(row.get("symbol","")).strip().upper()
-                if not symbol or symbol in seen or not re.match(r"^[A-Z0-9&.\-]{1,30}$", symbol):
-                    continue
-                seen.add(symbol)
-                items.append({"symbol":symbol,"company":str(row.get("name","")).strip(),"sector":str(row.get("sectorName","")).strip()})
-            if len(items) >= 100:
-                items.sort(key=lambda x:x["symbol"])
-                with _symbol_lock:
-                    _symbol_cache.update({"items":items,"time":now})
+            r=_http_session.get(url,headers={**HEADERS,"Accept":"application/json,*/*"},timeout=20); r.raise_for_status(); items=_normalize_symbol_rows(r.json())
+            if len(items)>=100:
+                with _symbol_lock: _symbol_cache.update({"items":items,"time":now})
                 return items
-            errors.append(f"{url}: only {len(items)} symbols")
-        except Exception as exc:
-            errors.append(f"{url}: {exc}")
-
-    raise RuntimeError("Complete PSX equity universe unavailable; refusing to return the 10-symbol development fallback. " + " | ".join(errors[-3:]))
-
+            errors.append(f"{url}: only {len(items)} regular equities")
+        except Exception as exc: errors.append(f"{url}: {exc}")
+    for url in (PSX_ALT_ELIGIBLE_URL,"https://dps.psx.com.pk/eligible-scrips"):
+        try:
+            r=_http_session.get(url,headers=HEADERS,timeout=20); r.raise_for_status(); items=_parse_eligible_scrips_html(r.text)
+            if len(items)>=100:
+                with _symbol_lock: _symbol_cache.update({"items":items,"time":now})
+                return items
+            errors.append(f"{url}: only {len(items)} rows")
+        except Exception as exc: errors.append(f"{url}: {exc}")
+    raise RuntimeError("Complete PSX equity universe unavailable: "+" | ".join(errors[-4:]))
 
 def _fallback_symbol_directory():
     # Kept only for legacy pages that explicitly request a development
@@ -2275,82 +2263,60 @@ def _table_rows_by_header(html, required_headers=()):
     raise RuntimeError(f"Could not find PSX table with headers: {sorted(wanted)}")
 
 
+def _parse_market_watch_json(payload):
+    out={}
+    for row in _extract_api_rows(payload):
+        sym=str(row.get("symbol") or row.get("SYMBOL") or "").strip().upper()
+        if not sym: continue
+        def pick(*keys):
+            for k in keys:
+                if k in row: return row[k]
+                if k.upper() in row: return row[k.upper()]
+            return None
+        out[sym]={"sector_code":str(pick("sector","SECTOR") or "").strip(),"listed_in":str(pick("listedIn","LISTED IN") or ""),"ldcp":_number(pick("ldcp","LDCP")),"open":_number(pick("open","OPEN")),"high":_number(pick("high","HIGH")),"low":_number(pick("low","LOW")),"price":_number(pick("current","CURRENT","price","PRICE")),"change":_number(pick("change","CHANGE")),"change_pct":_number(pick("change_pct","CHANGE (%)","changePercent")),"volume":_integer(pick("volume","VOLUME"))}
+    return out
+
+def _fetch_market_watch_table():
+    for url in (PSX_BULK_MARKET_WATCH_URL,f"{PSX_ALT_BASE}/market-watch"):
+        try:
+            r=_http_session.get(url,headers={**HEADERS,"X-Requested-With":"XMLHttpRequest"},timeout=25); r.raise_for_status(); ctype=(r.headers.get("content-type") or "").lower()
+            if "json" in ctype:
+                parsed=_parse_market_watch_json(r.json())
+                if parsed: return parsed
+            idx,rows=_table_rows_by_header(r.text,("SYMBOL","LDCP","OPEN","HIGH","LOW","CURRENT","CHANGE (%)","VOLUME")); out={}
+            for vals in rows:
+                sym=vals[idx["SYMBOL"]].strip().upper()
+                if not sym: continue
+                out[sym]={"sector_code":vals[idx["SECTOR"]].strip() if "SECTOR" in idx else "","listed_in":vals[idx["LISTED IN"]].strip() if "LISTED IN" in idx else "","ldcp":_number(vals[idx["LDCP"]]),"open":_number(vals[idx["OPEN"]]),"high":_number(vals[idx["HIGH"]]),"low":_number(vals[idx["LOW"]]),"price":_number(vals[idx["CURRENT"]]),"change":_number(vals[idx["CHANGE"]]) if "CHANGE" in idx else None,"change_pct":_number(vals[idx["CHANGE (%)"]]),"volume":_integer(vals[idx["VOLUME"]])}
+            if out: return out
+        except Exception: continue
+    raise RuntimeError("PSX market-watch feed unavailable")
+
 def fetch_psx_bulk_snapshot():
-    """Fetch the PSX public bulk tables once instead of making 555+ quote
-    requests. The screener supplies fundamentals; ALLSHR supplies current
-    price/change/volume. This is dramatically faster and avoids the failure
-    mode where every per-symbol request times out and the UI becomes 0/0."""
-    now = datetime.now(ZoneInfo("Asia/Karachi"))
-    errors=[]
-    screener_rows={}
+    now=datetime.now(ZoneInfo("Asia/Karachi")); allshr_rows=_fetch_market_watch_table(); errors=[]
+    try: directory=fetch_psx_symbols()
+    except Exception as exc: directory=[]; errors.append(f"symbols: {exc}")
+    meta={x["symbol"]:x for x in directory}; screener_rows={}
     try:
-        r=_http_session.get(PSX_BULK_SCREENER_URL, headers=HEADERS, timeout=25)
-        r.raise_for_status()
-        idx, rows=_table_rows_by_header(r.text, ("SYMBOL","PRICE","PE RATIO (TTM)","30D VOLUME AVG."))
+        r=_http_session.get(PSX_BULK_SCREENER_URL,headers={**HEADERS,"X-Requested-With":"XMLHttpRequest"},timeout=25); r.raise_for_status(); idx,rows=_table_rows_by_header(r.text,("SYMBOL","PRICE"))
         for vals in rows:
             sym=vals[idx["SYMBOL"]].strip().upper()
-            if not sym or not re.match(r"^[A-Z0-9&.\-]{1,30}$", sym):
-                continue
-            screener_rows[sym]={
-                "pe_ratio": _number(vals[idx["PE RATIO (TTM)"]]),
-                "price": _number(vals[idx["PRICE"]]),
-                "one_year_change": _number(vals[idx["1-YEAR CHANGE (%) *"]]) if "1-YEAR CHANGE (%) *" in idx else None,
-                "dividend_yield_pct": _number(vals[idx["DIVIDEND YIELD (%)"]]) if "DIVIDEND YIELD (%)" in idx else None,
-                "free_float": _parse_amount_token(vals[idx["FREE FLOAT"]]) if "FREE FLOAT" in idx else None,
-                "volume_30d_avg": _number(vals[idx["30D VOLUME AVG."]]),
-                "market_cap": _parse_amount_token(vals[idx["MARKET CAP."]]) if "MARKET CAP." in idx else None,
-            }
-    except Exception as exc:
-        errors.append(f"screener: {exc}")
-
-    allshr_rows={}
-    try:
-        # IMPORTANT: the old V8 endpoint /indices/ALLSHR is an index page,
-        # not a stock quote table. It therefore could not supply the
-        # per-symbol CURRENT/VOLUME rows and caused the entire bulk feed to
-        # fail. PSX publishes the actual market-wide quote table at
-        # /market-watch.
-        r=_http_session.get(PSX_BULK_MARKET_WATCH_URL, headers=HEADERS, timeout=25)
-        r.raise_for_status()
-        idx, rows=_table_rows_by_header(
-            r.text,
-            ("SYMBOL","LDCP","OPEN","HIGH","LOW","CURRENT","CHANGE (%)","VOLUME")
-        )
-        for vals in rows:
-            sym=vals[idx["SYMBOL"]].strip().upper()
-            if not sym or not re.match(r"^[A-Z0-9&.\-]{1,30}$", sym):
-                continue
-            allshr_rows[sym]={
-                "ldcp": _number(vals[idx["LDCP"]]),
-                "open": _number(vals[idx["OPEN"]]),
-                "high": _number(vals[idx["HIGH"]]),
-                "low": _number(vals[idx["LOW"]]),
-                "price": _number(vals[idx["CURRENT"]]),
-                "change": _number(vals[idx["CHANGE"]]) if "CHANGE" in idx else None,
-                "change_pct": _number(vals[idx["CHANGE (%)"]]),
-                "volume": _integer(vals[idx["VOLUME"]]),
-            }
-    except Exception as exc:
-        errors.append(f"market-watch: {exc}")
-
-    symbols=sorted(set(screener_rows)|set(allshr_rows))
+            if not sym: continue
+            def val_by(*names):
+                for name in names:
+                    key=next((k for k in idx if k==name or k.replace(" ","")==name.replace(" ","")),None)
+                    if key is not None: return vals[idx[key]]
+                return None
+            screener_rows[sym]={"pe_ratio":_number(val_by("PE RATIO (TTM)","P/E RATIO (TTM)","P/E")),"one_year_change":_number(val_by("1-YEAR CHANGE (%) *","1-YEAR CHANGE (%)")),"dividend_yield_pct":_number(val_by("DIVIDEND YIELD (%)","DIVIDEND YIELD")),"dividend_per_share":_number(val_by("DIVIDEND PER SHARE","DPS")),"eps_ttm":_number(val_by("EPS","EPS (TTM)","EARNINGS PER SHARE")),"book_value_per_share":_number(val_by("BOOK VALUE / SHARE","BOOK VALUE PER SHARE","BVPS")),"free_float":_parse_amount_token(val_by("FREE FLOAT")),"volume_30d_avg":_number(val_by("30D VOLUME AVG.","30D VOLUME AVG")),"market_cap":_parse_amount_token(val_by("MARKET CAP.","MARKET CAP"))}
+    except Exception as exc: errors.append(f"screener enrichment: {exc}")
     items=[]
-    for sym in symbols:
-        a=allshr_rows.get(sym,{})
-        b=screener_rows.get(sym,{})
-        meta=symbol_metadata(sym)
-        q={**meta, **b, **a, "symbol":sym}
-        # Market Watch is the preferred quote source. Screener fills missing fields.
-        q["price"]=a.get("price") if a.get("price") is not None else b.get("price")
-        q["source"]="PSX public bulk tables (Market Watch + Stock Screener)"
-        q["source_delay"]="PSX public data is delayed by up to 5 minutes unless otherwise indicated."
-        q["fetched_at"]=now.isoformat(timespec="seconds")
+    for sym,a in allshr_rows.items():
+        if meta and sym not in meta: continue
+        q={**meta.get(sym,{}),**screener_rows.get(sym,{}),**a,"symbol":sym,"price":a.get("price") if a.get("price") is not None else a.get("ldcp"),"source":"PSX Data Portal /market-watch","source_delay":"PSX public market data may be delayed by up to 5 minutes.","fetched_at":now.isoformat(timespec="seconds")}
+        if not q.get("sector"): q["sector"]=q.get("sector_code") or ""
         items.append(q)
-
-    if len(items) < 100:
-        raise RuntimeError("PSX bulk tables returned too few symbols" + ("; " + " | ".join(errors) if errors else ""))
-    return items, now.isoformat(timespec="seconds"), errors
-
+    if len(items)<100: raise RuntimeError(f"PSX market-watch returned only {len(items)} usable equities")
+    items.sort(key=lambda q:q["symbol"]); return items,now.isoformat(timespec="seconds"),errors
 
 def _persist_bulk_snapshot(items, updated_at):
     try:
@@ -2534,53 +2500,46 @@ def get_fundamentals(symbol):
 # ---------------------------------------------------------
 
 def fetch_mufap_funds(force=False):
-    """Fetch the current MUFAP NAV/Daily Prices table. The old nav-all.php
-    parser used the wrong column positions; the current MUFAP table is
-    Fund, Category, Inception, Offer, Repurchase, NAV, Validity Date, ..."""
     now=datetime.now()
     with _mufap_lock:
-        cached=_mufap_cache
-        if not force and cached["time"] and now-cached["time"] < timedelta(minutes=MUFAP_CACHE_MINUTES):
-            return cached["items"], cached["source"]
-    directory_by_name={f["name"].strip().lower():f for f in MUFAP_FUND_DIRECTORY}
+        if not force and _mufap_cache["time"] and now-_mufap_cache["time"] < timedelta(minutes=MUFAP_CACHE_MINUTES): return _mufap_cache["items"],_mufap_cache["source"]
+    directory={f["name"].strip().lower():f for f in MUFAP_FUND_DIRECTORY}; nav_rows=None; ret_rows=None; errors=[]
     try:
-        response=_http_session.get(MUFAP_NAV_URL, headers=HEADERS, timeout=25)
-        response.raise_for_status()
-        idx, rows=_table_rows_by_header(response.text,("FUND","CATEGORY","INCEPTION DATE","NAV","VALIDITY DATE"))
-        funds=[]
-        for vals in rows:
-            name=vals[idx["FUND"]].strip()
-            if not name or name.upper()=="FUND": continue
-            match=directory_by_name.get(name.lower(),{})
-            nav=_number(vals[idx["NAV"]])
+        r=_http_session.get(MUFAP_NAV_URL,headers=HEADERS,timeout=25); r.raise_for_status(); nav_rows=_table_rows_by_header(r.text,("FUND","CATEGORY","INCEPTION DATE","NAV","VALIDITY DATE"))
+    except Exception as e: errors.append(str(e))
+    try:
+        r=_http_session.get(MUFAP_RETURNS_URL,headers=HEADERS,timeout=25); r.raise_for_status(); ret_rows=_table_rows_by_header(r.text,("FUND NAME","NAV","YTD"))
+    except Exception as e: errors.append(str(e))
+    perf={}
+    if ret_rows:
+        idx,rows=ret_rows
+        for v in rows:
+            n=v[idx["FUND NAME"]].strip().lower(); perf[n]={"nav":_number(v[idx["NAV"]]),"ytd":_number(v[idx["YTD"]]),"validity_date":v[idx["VALIDITY DATE"]].strip() if "VALIDITY DATE" in idx else None}
+    funds=[]
+    if nav_rows:
+        idx,rows=nav_rows
+        for v in rows:
+            name=v[idx["FUND"]].strip(); key=name.lower(); d=directory.get(key,{}); p=perf.get(key,{})
+            nav=_number(v[idx["NAV"]]) if "NAV" in idx else p.get("nav")
+            if nav is None: nav=p.get("nav")
             if nav is None: continue
-            funds.append({
-                "name":name,
-                "amc":match.get("amc"),
-                "category":vals[idx["CATEGORY"]].strip() or match.get("category"),
-                "inception":vals[idx["INCEPTION DATE"]].strip() or match.get("inception"),
-                "offer":_number(vals[idx["OFFER"]]) if "OFFER" in idx else None,
-                "repurchase":_number(vals[idx["REPURCHASE"]]) if "REPURCHASE" in idx else None,
-                "nav":nav,
-                "validity_date":vals[idx["VALIDITY DATE"]].strip() if "VALIDITY DATE" in idx else None,
-                "front_end_load":_number(vals[idx["FRONT-END"]]) if "FRONT-END" in idx else None,
-                "back_end_load":_number(vals[idx["BACK-END"]]) if "BACK-END" in idx else None,
-                "aum_mn":match.get("aum_mn"),
-            })
-        if not funds: raise ValueError("No current MUFAP NAV rows parsed")
-        try: record_fund_nav_history(funds)
-        except Exception: pass
-        trends=get_fund_trends([f["name"] for f in funds])
-        funds=[{**f,"trend":trends.get(f["name"],[])} for f in funds]
-        with _mufap_lock:
-            _mufap_cache.update({"items":funds,"time":now,"source":"MUFAP live NAV / Daily Prices Announcement"})
-        return funds,"MUFAP live NAV / Daily Prices Announcement"
-    except Exception as exc:
-        with _mufap_lock:
-            old=list(_mufap_cache["items"])
-        if old:
-            return old, f"MUFAP cached last successful NAV — refresh failed: {exc}"
-        return MUFAP_FUND_DIRECTORY, f"MUFAP directory only — live NAV unavailable: {exc}"
+            funds.append({"name":name,"amc":d.get("amc"),"category":v[idx["CATEGORY"]].strip() if "CATEGORY" in idx else d.get("category"),"inception":v[idx["INCEPTION DATE"]].strip() if "INCEPTION DATE" in idx else d.get("inception"),"offer":_number(v[idx["OFFER"]]) if "OFFER" in idx else None,"repurchase":_number(v[idx["REPURCHASE"]]) if "REPURCHASE" in idx else None,"nav":nav,"validity_date":v[idx["VALIDITY DATE"]].strip() if "VALIDITY DATE" in idx else p.get("validity_date"),"front_end_load":_number(v[idx["FRONT-END"]]) if "FRONT-END" in idx else None,"back_end_load":_number(v[idx["BACK-END"]]) if "BACK-END" in idx else None,"aum_mn":d.get("aum_mn"),"ytd":p.get("ytd")})
+    elif ret_rows:
+        idx,rows=ret_rows
+        for v in rows:
+            name=v[idx["FUND NAME"]].strip(); p=perf.get(name.lower(),{}); d=directory.get(name.lower(),{}); nav=p.get("nav")
+            if nav is None: continue
+            funds.append({"name":name,"amc":d.get("amc"),"category":d.get("category"),"inception":d.get("inception"),"offer":None,"repurchase":None,"nav":nav,"validity_date":p.get("validity_date"),"front_end_load":None,"back_end_load":None,"aum_mn":d.get("aum_mn"),"ytd":p.get("ytd")})
+    if not funds:
+        with _mufap_lock: old=list(_mufap_cache["items"])
+        if old: return old,"MUFAP cached last successful NAV — refresh failed"
+        raise RuntimeError("MUFAP returned no authentic NAV rows: "+" | ".join(errors))
+    try: record_fund_nav_history(funds)
+    except Exception: pass
+    trends=get_fund_trends([f["name"] for f in funds]); funds=[{**f,"trend":trends.get(f["name"],[])} for f in funds]
+    source="MUFAP official NAV + Performance Summary"
+    with _mufap_lock: _mufap_cache.update({"items":funds,"time":now,"source":source})
+    return funds,source
 
 
 def record_fund_nav_history(funds):
@@ -3512,12 +3471,13 @@ def stocks_live():
         now_pk = datetime.now(ZoneInfo("Asia/Karachi"))
         in_session = now_pk.weekday() < 5 and (now_pk.hour > 9 or (now_pk.hour == 9 and now_pk.minute >= 30)) and (now_pk.hour < 15 or (now_pk.hour == 15 and now_pk.minute <= 30))
         valid_items = [q for q in bulk["items"] if q.get("price") is not None]
-        if valid_items and in_session:
-            market_state = "LIVE"
-            market_message = "PSX live/most-recent session data (public feed may be delayed up to 5 minutes)"
+        try: snapshot_pk=datetime.fromisoformat(bulk["updated_at"]).astimezone(ZoneInfo("Asia/Karachi")) if bulk.get("updated_at") else None
+        except Exception: snapshot_pk=None
+        same_trading_date=bool(snapshot_pk and snapshot_pk.date()==now_pk.date())
+        if valid_items and in_session and same_trading_date:
+            market_state="LIVE"; market_message="PSX live market-watch session (public feed may be delayed up to 5 minutes)."
         elif valid_items:
-            market_state = "CLOSED"
-            market_message = "PSX market is closed; showing the last successful session."
+            market_state="CLOSED"; market_message="PSX market is closed or the live session has not started; showing the last successful session."
         else:
             market_state = "FEED_UNAVAILABLE"
             market_message = "No real PSX quote data is currently available from the supported feeds."
@@ -3802,11 +3762,9 @@ def _mufap_response():
     if cached_items and cached_time and now - cached_time < timedelta(minutes=MUFAP_CACHE_MINUTES):
         return cached_items, cached_source
 
-    # Cold start: use the complete bundled MUFAP directory immediately.
-    # If a stale live cache exists, prefer it over the static directory.
     if not cached_items:
-        cached_items = MUFAP_FUND_DIRECTORY
-        cached_source = "MUFAP directory (bundled fallback)"
+        try: return fetch_mufap_funds(force=True)
+        except Exception as exc: return [], f"MUFAP live data unavailable: {exc}"
     _start_mufap_refresh(force=True)
     return cached_items, cached_source
 
@@ -3973,124 +3931,41 @@ def _parse_company_announcements(html, symbol, limit=50):
     return out
 
 
+def fetch_psx_company_announcements(symbol="",limit=100,days=60):
+    symbol=(symbol or "").strip().upper(); limit=max(1,min(int(limit),100)); date_to=datetime.now(ZoneInfo("Asia/Karachi")).date().isoformat(); date_from=(datetime.now(ZoneInfo("Asia/Karachi")).date()-timedelta(days=days)).isoformat(); out=[]; seen=set(); offset=0
+    for _ in range(4):
+        payload={"type":"C","symbol":symbol,"query":"","count":50,"offset":offset,"date_from":date_from,"date_to":date_to,"page":"annc"}; got=False
+        for url in (PSX_ANNOUNCEMENTS_URL,PSX_ALT_ANNOUNCEMENTS_URL):
+            try:
+                r=_http_session.post(url,data=payload,headers={**HEADERS,"Content-Type":"application/x-www-form-urlencoded; charset=UTF-8","X-Requested-With":"XMLHttpRequest","Accept":"text/html,*/*;q=0.1"},timeout=15); r.raise_for_status(); soup=BeautifulSoup(r.text,"html.parser"); rows=soup.select("tbody tr") or soup.find_all("tr")
+                for row in rows:
+                    cells=[" ".join(c.get_text(" ",strip=True).split()) for c in row.find_all("td")]
+                    if len(cells)<5: continue
+                    href=next((a.get("href") for a in row.find_all("a",href=True) if "pdf" in str(a.get("href")).lower() or "download" in str(a.get("href")).lower()),None)
+                    if href and href.startswith("/"): href=PSX_ALT_BASE+href
+                    title=cells[4]; sym=cells[2] if len(cells)>2 else symbol; key=(cells[0],cells[1],sym,title,href)
+                    if key in seen: continue
+                    seen.add(key); out.append({"date":cells[0],"time":cells[1],"symbol":sym,"title":title,"url":href or "https://dps.psx.com.pk/announcements/companies"})
+                    if len(out)>=limit: return out
+                got=True
+                if len(rows)<50: return out
+                break
+            except Exception: continue
+        if not got: break
+        offset+=50
+    return out
+
 @app.get("/api/psx/announcements")
 def psx_announcements():
-    symbol = request.args.get("symbol", "").strip().upper()
-    limit = min(max(int(request.args.get("limit", 50) or 50), 1), 100)
-    result = {"ok": True, "symbol": symbol or None, "announcements": [], "source": "Pakistan Stock Exchange"}
-    try:
-        if symbol:
-            html, source_url = _fetch_psx_html([PSX_ALT_COMPANY_URL.format(symbol=symbol), PSX_COMPANY_URL.format(symbol=symbol)], timeout=10)
-            result["announcements"] = _parse_company_announcements(html, symbol, limit)
-            result["source_url"] = source_url
-        else:
-            html, source_url = _fetch_psx_html(["https://dps.csapis.com/announcements/companies", "https://dps.psx.com.pk/announcements/companies"], timeout=10)
-            soup = BeautifulSoup(html, "html.parser")
-            rows=[]; seen=set()
-            for row in soup.find_all("tr"):
-                cells=[" ".join(c.get_text(" ", strip=True).split()) for c in row.find_all(["td","th"])]
-                if len(cells) < 4: continue
-                links=row.find_all("a", href=True)
-                href=next((a.get("href") for a in links if "download" in str(a.get("href")).lower() or "pdf" in str(a.get("href")).lower()), None)
-                if not href: continue
-                symbol_cell=next((c for c in cells if re.fullmatch(r"[A-Z0-9&.\-]{1,30}", c.strip())), "")
-                if not symbol_cell: continue
-                title=cells[-1] if cells[-1] else "PSX announcement"
-                if href.startswith("/"): href=PSX_ALT_BASE+href
-                elif href.startswith("http://"): href="https://"+href[7:]
-                key=(symbol_cell,title,href)
-                if key in seen: continue
-                seen.add(key); rows.append({"symbol":symbol_cell,"title":" | ".join(cells),"url":href})
-                if len(rows)>=limit: break
-            result["announcements"]=rows; result["source_url"]=source_url
-        result["available"] = bool(result["announcements"])
-    except Exception as exc:
-        result["ok"] = False; result["error"] = str(exc)
-    return safe_jsonify(result)
+    symbol=request.args.get("symbol","").strip().upper(); limit=min(max(int(request.args.get("limit",50) or 50),1),100)
+    try: rows=fetch_psx_company_announcements(symbol,limit,60); return safe_jsonify({"ok":True,"available":bool(rows),"symbol":symbol or None,"announcements":rows,"source":"Pakistan Stock Exchange","source_url":"https://dps.psx.com.pk/announcements/companies"})
+    except Exception as exc: return safe_jsonify({"ok":False,"available":False,"symbol":symbol or None,"announcements":[],"error":str(exc)})
 
 
 @app.get("/api/psx/financials")
 def psx_financials():
-    """Live PSX corporate announcements + official report destinations.
-    The app never fabricates a financial filing; when PSX is temporarily
-    unreachable the endpoint returns the official destination links and a
-    clear source/error status."""
-    symbol = request.args.get("symbol", "").strip().upper()
-    limit = min(max(int(request.args.get("limit", 50) or 50), 1), 100)
-    result = {
-        "available": False,
-        "source": "Pakistan Stock Exchange",
-        "announcements": [],
-        "reports": [],
-        "official_links": {
-            "company_announcements": "https://dps.csapis.com/announcements/companies",
-            "financial_reports": "https://financials.psx.com.pk/",
-            "analysis_reports": "https://dps.csapis.com/analysis-reports",
-            "daily_downloads": "https://dps.csapis.com/downloads",
-        },
-        "symbol": symbol or None,
-    }
-    try:
-        if symbol:
-            html, source_url = _fetch_psx_html([
-                PSX_COMPANY_URL.format(symbol=symbol),
-                PSX_ALT_COMPANY_URL.format(symbol=symbol),
-            ])
-            soup = BeautifulSoup(html, "html.parser")
-            # Company pages expose filings as table rows whose document link
-            # often says only "View PDF". Read the whole row so the actual
-            # financial-result/report title is preserved.
-            for row in soup.find_all("tr"):
-                cells = [" ".join(c.get_text(" ", strip=True).split()) for c in row.find_all(["td", "th"])]
-                row_text = " | ".join(x for x in cells if x)
-                low = row_text.lower()
-                if not row_text or not any(k in low for k in ("report", "financial", "results", "announcement", "statement", "notice", "payout", "quarter", "half year", "annual")):
-                    continue
-                a = row.find("a", href=True)
-                if not a:
-                    continue
-                href = a.get("href")
-                if href.startswith("/"):
-                    href = "https://dps.csapis.com" + href
-                elif href.startswith("http://"):
-                    href = "https://" + href[7:]
-                if not href.startswith("http"):
-                    continue
-                result["announcements"].append({"title": row_text[:500], "url": href})
-                if len(result["announcements"]) >= limit:
-                    break
-
-            # Fallback for markup where filings are not inside table rows.
-            if not result["announcements"]:
-                for a in soup.find_all("a", href=True):
-                    text = " ".join(a.get_text(" ", strip=True).split())
-                    href = a.get("href")
-                    if not text:
-                        continue
-                    low = text.lower()
-                    if not any(k in low for k in ("report", "financial", "results", "announcement", "statement", "notice", "payout")):
-                        continue
-                    if href.startswith("/"):
-                        href = "https://dps.csapis.com" + href
-                    elif href.startswith("http://"):
-                        href = "https://" + href[7:]
-                    if href.startswith("http"):
-                        result["announcements"].append({"title": text, "url": href})
-                    if len(result["announcements"]) >= limit:
-                        break
-            result["available"] = bool(result["announcements"])
-            result["source_url"] = source_url
-        else:
-            html, source_url = _fetch_psx_html([
-                "https://dps.psx.com.pk/announcements/companies",
-                "https://dps.csapis.com/announcements/companies",
-            ])
-            result["announcements"] = parse_psx_announcement_page(html, limit)
-            result["available"] = bool(result["announcements"])
-            result["source_url"] = source_url
-    except Exception as exc:
-        result["error"] = str(exc)
-    return safe_jsonify(result)
+    symbol=request.args.get("symbol","").strip().upper(); limit=min(max(int(request.args.get("limit",50) or 50),1),100); rows=fetch_psx_company_announcements(symbol,limit,60)
+    return safe_jsonify({"available":bool(rows),"source":"Pakistan Stock Exchange","announcements":rows,"reports":[],"symbol":symbol or None,"official_links":{"company_announcements":"https://dps.psx.com.pk/announcements/companies","financial_reports":"https://financials.psx.com.pk/","analysis_reports":"https://dps.psx.com.pk/analysis-reports","daily_downloads":"https://dps.psx.com.pk/downloads"}})
 
 
 @app.get("/api/journal")
@@ -4744,6 +4619,34 @@ def analyze_intraday_symbol(df):
     }
 
 
+CRYPTO_COINGECKO_IDS={"BTC":"bitcoin","ETH":"ethereum","USDT":"tether","BNB":"binancecoin","SOL":"solana","USDC":"usd-coin","XRP":"ripple","ADA":"cardano","DOGE":"dogecoin","AVAX":"avalanche-2","SHIB":"shiba-inu","DOT":"polkadot","LINK":"chainlink","TRX":"tron","POL":"matic-network","BCH":"bitcoin-cash","NEAR":"near","LTC":"litecoin"}
+
+def _fetch_coingecko_price_history(coin_id,days):
+    r=_http_session.get(f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart",params={"vs_currency":"usd","days":days,"precision":"full"},headers={**HEADERS,"Accept":"application/json"},timeout=20); r.raise_for_status(); prices=r.json().get("prices") or []; rows=[]
+    for pair in prices:
+        if isinstance(pair,list) and len(pair)>=2:
+            ts=_number(pair[0]); price=_number(pair[1]);
+            if ts and price and price>0: rows.append((pd.to_datetime(ts,unit="ms",utc=True).tz_convert(None),price))
+    raw=pd.DataFrame(rows,columns=["date","price"]).sort_values("date").drop_duplicates("date"); g=raw.set_index("date")["price"]; df=pd.DataFrame({"open":g.resample("5min").first(),"high":g.resample("5min").max(),"low":g.resample("5min").min(),"close":g.resample("5min").last()}).dropna().reset_index(); df["volume"]=0; return _sanitize_ohlcv(df)
+
+def run_crypto_technical_scan(progress_cb=None):
+    results={"30m":[],"1h":[],"4h":[]}; total=len(CRYPTO_TECH_SYMBOLS); done=0
+    for spec in CRYPTO_TECH_SYMBOLS:
+        sym=spec["yf"].split("-",1)[0].upper(); base={"symbol":spec["yf"],"display":spec["display"]}
+        try:
+            df7=_fetch_coingecko_price_history(CRYPTO_COINGECKO_IDS[sym],7); df30=_fetch_coingecko_price_history(CRYPTO_COINGECKO_IDS[sym],30)
+            for label,rule in (("30m","30min"),("1h","1h"),("4h","4h")):
+                source=df30 if label=="4h" else df7; d=source.set_index("date"); bar=d.resample(rule).agg({"open":"first","high":"max","low":"min","close":"last","volume":"sum"}).dropna().reset_index(); row=dict(base)
+                try: row.update(analyze_intraday_symbol(bar))
+                except Exception as e: row["error"]=str(e)
+                results[label].append(row); done+=1
+                if progress_cb: progress_cb(done,total*3,f"{spec['display']} ({label})")
+        except Exception as e:
+            for label in results: row=dict(base); row["error"]=str(e); results[label].append(row); done+=1;
+            if progress_cb: progress_cb(done,total*3,f"{spec['display']}")
+        time.sleep(0.35)
+    return results
+
 def run_intraday_technical_scan(symbol_list, timeframes, progress_cb=None):
     """timeframes: list of (label, yf_interval, yf_period, resample_rule_or_None).
 
@@ -4935,17 +4838,18 @@ def api_forextech_scan_cached():
 
 @app.get("/api/cryptotech/scan/start")
 def api_cryptotech_scan_start():
-    guard = _technicals_guard()
-    if guard:
-        return guard
-    job_id = _new_tech_job()
-    timeframes = [
-        ("30m", "30m", "60d", None),
-        ("1h", "60m", "60d", None),
-        ("4h", "60m", "60d", "4h"),
-    ]
-    _run_tech_job_in_background(job_id, "cryptotech", CRYPTO_TECH_SYMBOLS, timeframes)
-    return safe_jsonify({"ok": True, "job_id": job_id})
+    guard=_technicals_guard()
+    if guard: return guard
+    job_id=_new_tech_job()
+    def worker():
+        if not _try_start_heavy_scan("cryptotech"):
+            _update_tech_job(job_id,status="error",error="Another technical scan is already running."); return
+        try:
+            def progress(done,total,sym): _update_tech_job(job_id,progress={"done":done,"total":total,"symbol":sym})
+            result=run_crypto_technical_scan(progress); _save_tech_cache("cryptotech",result); _update_tech_job(job_id,status="done",result=result)
+        except Exception as e: _update_tech_job(job_id,status="error",error=str(e))
+        finally: _finish_heavy_scan()
+    threading.Thread(target=worker,daemon=True).start(); return safe_jsonify({"ok":True,"job_id":job_id})
 
 
 @app.get("/api/cryptotech/scan/status/<job_id>")
@@ -5088,12 +4992,23 @@ def fetch_yahoo_psx_intraday(symbol, interval="60m", period="60d"):
     return df
 
 
-def fetch_real_chart_history(symbol, cfg):
-    if cfg.get("mode") == "intraday":
-        # First try Yahoo's genuine .KA hourly history.  The official PSX
-        # timeseries endpoint is price-only in some deployments and therefore
-        # cannot safely be used to construct OHLCV candles.
-        return fetch_yahoo_psx_intraday(symbol, cfg["interval"], cfg["period"])
+def _intraday_price_df_from_psx(symbol):
+    points=get_intraday(symbol); rows=[]
+    for p in points:
+        try:
+            ts=float(p["x"]); price=float(p["y"]);
+            if price>0: rows.append((pd.to_datetime(ts,unit="s",utc=True).tz_convert(None),price))
+        except Exception: pass
+    if len(rows)<2: raise RuntimeError("PSX returned no usable intraday price ticks")
+    return pd.DataFrame(rows,columns=["date","price"]).sort_values("date").drop_duplicates("date")
+
+def _bucket_intraday_prices(symbol,rule,lookback):
+    raw=_intraday_price_df_from_psx(symbol); end=raw["date"].max(); raw=raw[raw["date"]>=end-pd.Timedelta(hours=lookback)]
+    g=raw.set_index("date")["price"].resample(rule); df=pd.DataFrame({"open":g.first(),"high":g.max(),"low":g.min(),"close":g.last()}).dropna().reset_index(); df["volume"]=0
+    return _sanitize_ohlcv(df)
+
+def fetch_real_chart_history(symbol,cfg):
+    if cfg.get("mode")=="intraday": return _bucket_intraday_prices(symbol,cfg.get("resample") or "5min",cfg.get("lookback_hours",24))
     return get_full_history_cached(symbol)
 
 
@@ -5172,6 +5087,25 @@ def _parse_history_html(html):
     return _sanitize_ohlcv(df)
 
 
+def fetch_psx_eod_history(symbol):
+    symbol=symbol.upper().strip(); last=None
+    for url in (PSX_EOD_URL.format(symbol=symbol),PSX_ALT_EOD_URL.format(symbol=symbol)):
+        try:
+            r=_http_session.get(url,headers={**HEADERS,"Accept":"application/json,*/*"},timeout=15); r.raise_for_status(); payload=r.json(); data=payload.get("data") if isinstance(payload,dict) else payload
+            if isinstance(data,dict): data=data.get("data") or data.get("items") or data.get("rows")
+            rows=[]
+            for row in data or []:
+                if not isinstance(row,(list,tuple)) or len(row)<2: continue
+                ts=_number(row[0]); close=_number(row[1]); volume=_number(row[2]) if len(row)>2 else None; op=_number(row[3]) if len(row)>3 else close
+                if ts is None or close is None or close<=0: continue
+                op=op if op and op>0 else close; rows.append({"date":pd.to_datetime(ts,unit="s",utc=True).tz_convert(None),"open":op,"high":max(op,close),"low":min(op,close),"close":close,"volume":volume})
+            df=pd.DataFrame(rows)
+            if len(df)>=5: return _sanitize_ohlcv(df)
+            raise RuntimeError("PSX EOD returned too few valid rows")
+        except Exception as exc: last=exc
+    raise last or RuntimeError("PSX EOD unavailable")
+
+
 def fetch_psx_history_direct(symbol, max_retries=2, retry_delays=(1, 2)):
     """Real PSX-listed daily OHLCV provider chain.
 
@@ -5181,7 +5115,8 @@ def fetch_psx_history_direct(symbol, max_retries=2, retry_delays=(1, 2)):
     """
     symbol=symbol.upper().strip()
     errors=[]
-    for label, fn in (("PSX scraper API", lambda: fetch_psx_scraper_history(symbol)),
+    for label, fn in (("PSX official EOD JSON", lambda: fetch_psx_eod_history(symbol)),
+                      ("PSX scraper API", lambda: fetch_psx_scraper_history(symbol)),
                       ("Yahoo .KA", lambda: fetch_yahoo_psx_history(symbol, "max"))):
         try:
             df=fn()
@@ -5465,8 +5400,20 @@ def _prefetch_psx_histories_batch(symbols, period="2y", batch_size=50, max_worke
     stored = 0
     import concurrent.futures
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(max_workers, len(batches))) as pool:
-        for n in pool.map(one_batch, batches):
-            stored += n
+        for n in pool.map(one_batch, batches): stored += n
+    with _psx_divergence_history_cache_lock: unresolved=[sym for sym in clean if sym not in _psx_divergence_history_cache]
+    def official_one(sym):
+        try:
+            df=fetch_psx_eod_history(sym)
+            if df is not None and len(df)>=20:
+                now2=datetime.now()
+                with _psx_divergence_history_cache_lock: _psx_divergence_history_cache[sym]={"df":df,"time":now2}
+                with _stock_history_cache_lock: _stock_history_cache[sym]={"df":df,"time":now2}
+                return 1
+        except Exception: pass
+        return 0
+    if unresolved:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(8,len(unresolved))) as pool: stored += sum(pool.map(official_one,unresolved))
     return stored
 
 
@@ -5993,28 +5940,17 @@ def stock_verdict(symbol):
 # toggles) is served from the already-fetched DataFrame.
 
 CHART_TIMEFRAME_CONFIG = {
-    # Intraday intervals are NEVER synthesized from daily data.  They use a
-    # genuine hourly provider chain and return unavailable when real hourly
-    # history is not supplied by the upstream provider.
-    "1H": {"mode": "intraday", "interval": "60m", "period": "60d", "resample": None},
-    "5H": {"mode": "intraday", "interval": "60m", "period": "60d", "resample": "5h"},
-    # "years" bounds the VISIBLE WINDOW, not just the candle size. An
-    # earlier version showed up to 12+ years of daily candles for "1D" —
-    # thousands of bars compressed into one chart, which rendered as a
-    # dense, broken-looking hash pattern rather than a readable recent
-    # chart. Each button below now shows a window sized so the candle
-    # count stays readable (roughly 40-250 bars), the same way "1D"/"1M"/
-    # "1Y" behave in every normal stock-charting tool: the label is how
-    # far back you're looking, and the candle size is chosen for that.
-    "1D": {"mode": "daily", "years": 30 / 365.25, "resample": None},
-    "5D": {"mode": "daily", "years": 90 / 365.25, "resample": None},
-    "1M": {"mode": "daily", "years": 180 / 365.25, "resample": None},
-    "3M": {"mode": "daily", "years": 1, "resample": None},
-    "6M": {"mode": "daily", "years": 2, "resample": "3D"},
-    "1Y": {"mode": "daily", "years": 5, "resample": "W"},
-    "3Y": {"mode": "daily", "years": 10, "resample": "ME"},
-    "5Y": {"mode": "daily", "years": 20, "resample": "ME"},
-    "ALL": {"mode": "daily", "years": None, "resample": "ME"},
+    "1H": {"mode":"intraday","lookback_hours":1,"resample":"5min"},
+    "5H": {"mode":"intraday","lookback_hours":5,"resample":"15min"},
+    "1D": {"mode":"intraday","lookback_hours":24,"resample":"15min"},
+    "5D": {"mode":"daily","days":7,"resample":None},
+    "1M": {"mode":"daily","days":31,"resample":None},
+    "3M": {"mode":"daily","days":100,"resample":None},
+    "6M": {"mode":"daily","days":190,"resample":None},
+    "1Y": {"mode":"daily","days":370,"resample":"W"},
+    "3Y": {"mode":"daily","days":1100,"resample":"ME"},
+    "5Y": {"mode":"daily","days":1850,"resample":"ME"},
+    "ALL": {"mode":"daily","days":None,"resample":"ME"},
 }
 CHART_MIN_CANDLES = 5
 
@@ -6135,8 +6071,8 @@ def stock_chart(symbol):
     pivot_close = float(pivot_row["close"])
 
     windowed = full_df
-    if cfg.get("mode") == "daily" and cfg.get("years") is not None:
-        cutoff = full_df["date"].iloc[-1] - pd.Timedelta(days=365.25 * cfg["years"])
+    if cfg.get("mode") == "daily" and cfg.get("days") is not None:
+        cutoff = full_df["date"].iloc[-1] - pd.Timedelta(days=cfg["days"])
         windowed = full_df[full_df["date"] >= cutoff].reset_index(drop=True)
 
     try:
@@ -6191,110 +6127,38 @@ def stock_chart(symbol):
 # detail page does, without needing a PSX-specific provider chain: any
 # CoinGecko-listed coin's Yahoo Finance ticker is just SYMBOL-USD.
 
-CRYPTO_CHART_TIMEFRAME_CONFIG = {
-    "1D": {"interval": "5m", "period": "1d"},
-    "1W": {"interval": "60m", "period": "7d"},
-    "1M": {"interval": "1d", "period": "1mo"},
-    "3M": {"interval": "1d", "period": "3mo"},
-    "1Y": {"interval": "1d", "period": "1y"},
-    "ALL": {"interval": "1wk", "period": "max"},
-}
-CRYPTO_CHART_INTRADAY_INTERVALS = {"1m", "2m", "5m", "15m", "30m", "60m", "90m", "1h"}
+CRYPTO_CHART_TIMEFRAME_CONFIG={"1D":{"days":1},"1W":{"days":7},"1M":{"days":30},"3M":{"days":90},"1Y":{"days":365},"ALL":{"days":"max"}}
+_crypto_chart_cache={}; _crypto_chart_cache_lock=threading.Lock(); CRYPTO_CHART_CACHE_MINUTES=5
 
-_crypto_chart_cache = {}
-_crypto_chart_cache_lock = threading.Lock()
-CRYPTO_CHART_CACHE_MINUTES = 5
+def _crypto_coin_id(symbol):
+    upper=symbol.upper().strip();
+    with _crypto_lock:
+        for c in _crypto_cache.get("items",[]):
+            if str(c.get("symbol","")).upper()==upper and c.get("id"): return c["id"]
+    return {"BTC":"bitcoin","ETH":"ethereum","USDT":"tether","BNB":"binancecoin","SOL":"solana","USDC":"usd-coin","XRP":"ripple","ADA":"cardano","DOGE":"dogecoin","AVAX":"avalanche-2","SHIB":"shiba-inu","DOT":"polkadot","LINK":"chainlink","TRX":"tron","POL":"matic-network","BCH":"bitcoin-cash","NEAR":"near","LTC":"litecoin"}.get(upper,upper.lower())
 
-
-def fetch_crypto_ohlc_history(symbol, interval, period):
-    import yfinance as yf
-
-    symbol = symbol.upper().strip()
-    if not re.match(r"^[A-Z0-9]{1,15}$", symbol):
-        raise ValueError(f"Invalid crypto symbol: {symbol!r}")
-    ticker = f"{symbol}-USD"
-
-    df = None
-    last_exc = None
-    for attempt in range(3):
-        try:
-            df = yf.download(ticker, interval=interval, period=period, progress=False, auto_adjust=False)
-        except Exception as e:
-            df = None
-            last_exc = e
-        if df is not None and not df.empty:
-            break
-        if attempt < 2:
-            time.sleep(3 * (2 ** attempt))
-    if df is None or df.empty:
-        raise RuntimeError(f"No data returned for {ticker} at interval={interval}." + (f" ({last_exc})" if last_exc else ""))
-
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
-    df = df.reset_index()
-    df = df.rename(columns={c: str(c).lower() for c in df.columns})
-    date_col = "date" if "date" in df.columns else ("datetime" if "datetime" in df.columns else df.columns[0])
-    df = df.rename(columns={date_col: "date"})
-
-    missing = [c for c in ("date", "open", "high", "low", "close") if c not in df.columns]
-    if missing:
-        raise RuntimeError(f"Unexpected data shape from yfinance for {ticker} — missing columns {missing}.")
-    if "volume" not in df.columns:
-        df["volume"] = None
-
-    df["date"] = pd.to_datetime(df["date"], errors="coerce", utc=True).dt.tz_localize(None)
-    for c in ("open", "high", "low", "close", "volume"):
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    df = df.dropna(subset=["date", "close"]).sort_values("date").drop_duplicates("date").reset_index(drop=True)
-    df = _sanitize_ohlcv(df)
-    if len(df) < 2:
-        raise RuntimeError(f"Too few candles returned for {ticker}.")
-    return df
-
-
-def get_crypto_chart_cached(symbol, interval, period):
-    key = f"{symbol.upper()}:{interval}:{period}"
-    now = datetime.now()
-    with _crypto_chart_cache_lock:
-        entry = _crypto_chart_cache.get(key)
-        if entry and now - entry["time"] < timedelta(minutes=CRYPTO_CHART_CACHE_MINUTES):
-            return entry["df"]
-    df = fetch_crypto_ohlc_history(symbol, interval, period)
-    with _crypto_chart_cache_lock:
-        _crypto_chart_cache[key] = {"df": df, "time": now}
-    return df
-
+def fetch_crypto_ohlc_history(symbol,days):
+    coin_id=_crypto_coin_id(symbol); r=_http_session.get(f"https://api.coingecko.com/api/v3/coins/{coin_id}/ohlc",params={"vs_currency":"usd","days":days,"precision":"full"},headers={**HEADERS,"Accept":"application/json"},timeout=20); r.raise_for_status(); rows=[]
+    for x in r.json() or []:
+        if isinstance(x,list) and len(x)>=5:
+            ts=_number(x[0]); o,h,l,c=[_number(v) for v in x[1:5]]
+            if ts and all(v and v>0 for v in (o,h,l,c)): rows.append({"date":pd.to_datetime(ts,unit="ms",utc=True).tz_convert(None),"open":o,"high":h,"low":l,"close":c,"volume":0})
+    df=pd.DataFrame(rows)
+    if len(df)<2: raise RuntimeError("CoinGecko returned too few OHLC rows")
+    return _sanitize_ohlcv(df)
 
 @app.get("/api/crypto/chart/<symbol>")
 def crypto_chart(symbol):
-    guard = _technicals_guard()
-    if guard:
-        return guard
-
-    timeframe = request.args.get("timeframe", "1M").upper()
-    cfg = CRYPTO_CHART_TIMEFRAME_CONFIG.get(timeframe, CRYPTO_CHART_TIMEFRAME_CONFIG["1M"])
-
+    tf=request.args.get("timeframe","1M").upper(); cfg=CRYPTO_CHART_TIMEFRAME_CONFIG.get(tf,CRYPTO_CHART_TIMEFRAME_CONFIG["1M"]); key=f"{symbol.upper()}:{tf}"; now=datetime.now()
     try:
-        df = get_crypto_chart_cached(symbol, cfg["interval"], cfg["period"])
-    except Exception as e:
-        return safe_jsonify({"available": False, "symbol": symbol.upper(), "timeframe": timeframe, "note": f"Real candles are unavailable from Yahoo Finance for this coin right now: {e}"})
-
-    future_cutoff = pd.Timestamp.now() + pd.Timedelta(days=2)
-    df = df[df["date"] <= future_cutoff]
-    if df.empty:
-        return safe_jsonify({"available": False, "symbol": symbol.upper(), "timeframe": timeframe, "note": "No real OHLCV history is available for this timeframe."})
-
-    is_intraday = cfg["interval"] in CRYPTO_CHART_INTRADAY_INTERVALS
-    candles, volume = _ohlc_to_candles_and_volume(df, is_intraday)
-
-    return safe_jsonify({
-        "available": True,
-        "symbol": symbol.upper(),
-        "timeframe": timeframe,
-        "data_source": "Yahoo Finance",
-        "candles": candles,
-        "volume": volume,
-    })
+        with _crypto_chart_cache_lock: entry=_crypto_chart_cache.get(key)
+        if not entry or now-entry["time"]>=timedelta(minutes=CRYPTO_CHART_CACHE_MINUTES):
+            df=fetch_crypto_ohlc_history(symbol,cfg["days"]);
+            with _crypto_chart_cache_lock: _crypto_chart_cache[key]={"df":df,"time":now}
+        else: df=entry["df"]
+        candles,volume=_ohlc_to_candles_and_volume(df,True)
+        return safe_jsonify({"available":True,"symbol":symbol.upper(),"timeframe":tf,"data_source":"CoinGecko OHLC (real market data)","candles":candles,"volume":volume})
+    except Exception as e: return safe_jsonify({"available":False,"symbol":symbol.upper(),"timeframe":tf,"note":f"Real crypto candles are unavailable right now: {e}"})
 
 
 # =====================================================================

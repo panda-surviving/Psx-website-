@@ -1859,3 +1859,5 @@ table.flow-matrix td:first-child{text-align:left;font-weight:700}
   .main-price-chart{height:260px}
   .indicator-chart{height:90px}
 }
+
+.screener-alphabet{display:flex;flex-wrap:wrap;gap:5px;align-items:center;padding-top:22px;max-width:100%}.screener-alphabet .screener-letter{min-width:32px;padding:7px 8px}.screener-alphabet .screener-letter.active{outline:2px solid currentColor}@media(max-width:700px){.screener-alphabet{padding-top:0}.screener-alphabet .screener-letter{min-width:29px;padding:6px 7px}}
